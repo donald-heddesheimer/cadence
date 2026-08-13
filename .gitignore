@@ -1,5 +1,6 @@
 # Working notes that are not part of the published library.
 dev/
+docs/*
 
 build/
 build-*/

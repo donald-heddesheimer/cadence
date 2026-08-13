@@ -2,11 +2,25 @@ BasedOnStyle: Google
 Language: Cpp
 Standard: c++17
 
-# Code wraps at 100. Comments do not wrap at all: ReflowComments leaves prose
-# lines exactly as written, however long, so an explanation can be one line
-# instead of an artificially chopped paragraph.
-ColumnLimit: 100
+# Four spaces per level, never tabs.
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Nothing wraps automatically. ColumnLimit 0 tells clang-format to keep the line
+# breaks the author wrote, for code and for prose alike, so an explanation or a
+# printf argument list can be one long line instead of an artificially chopped
+# paragraph. ReflowComments is redundant at that point but stays for clarity.
+ColumnLimit: 0
 ReflowComments: false
+
+# Namespace bodies are indented, with one deliberate exception this file cannot
+# express: only the outermost namespace is indented by hand, so the body of a
+# nested `namespace detail` stays level with its opening brace. clang-format has
+# no setting for that -- All indents every level, None indents none -- so
+# namespace indentation in this repo is maintained by hand and clang-format is
+# not run over the tree in CI. Format a file by eye, not with -i.
+NamespaceIndentation: All
 
 DerivePointerAlignment: false
 PointerAlignment: Left

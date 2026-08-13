@@ -124,12 +124,8 @@ jobs:
           cmake --build consumer/build -j
           ./consumer/build/consumer
 
-  format:
-    name: clang-format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check formatting
-        run: |
-          find include tests examples benchmarks -name '*.h' -o -name '*.cc' -o -name '*.cu' \
-            | xargs clang-format --dry-run --Werror
+  # No clang-format job. The house style indents only the outermost namespace,
+  # which no NamespaceIndentation setting produces, so clang-format cannot be
+  # made authoritative here without rewriting every header against the style.
+  # .clang-format still describes the intent for editors; it is a guide rather
+  # than a gate. Re-add a job here if the namespace rule is ever dropped.

@@ -1,22 +1,19 @@
-// cadence — platform detection and compile-out switches.
+// cadence: platform detection and compile-out switches.
 //
 // This header decides three things, in order of importance:
 //   1. Is cadence enabled at all?          (CADENCE_DISABLE)
 //   2. Is a CUDA runtime available?        (CADENCE_HAS_CUDA)
 //   3. Is NVTX available for passthrough?  (CADENCE_HAS_NVTX)
-//
-// Everything downstream keys off these macros so that a translation unit
-// without CUDA still compiles the host-side timers.
 #pragma once
 
-// 1. Master switch. -DCADENCE_DISABLE reduces every macro in the macro front-end to nothing, mirroring how NVTX compiles out with -DNVTX_DISABLE. No runtime branch is left behind.
+// Master switch. -DCADENCE_DISABLE reduces every macro in the macro front-end to nothing, mirroring how NVTX compiles out with -DNVTX_DISABLE.
 #if defined(CADENCE_DISABLE)
 #define CADENCE_ENABLED 0
 #else
 #define CADENCE_ENABLED 1
 #endif
 
-// 2. CUDA runtime.
+// CUDA runtime
 #if !defined(CADENCE_HAS_CUDA)
 #if defined(__CUDACC__) || defined(CUDART_VERSION)
 #define CADENCE_HAS_CUDA 1
@@ -35,7 +32,7 @@
 #include <cuda_runtime.h>
 #endif
 
-// 3. NVTX passthrough. NVTX v3 ships with the CUDA Toolkit and is header-only: no library to link.
+// NVTX passthrough. NVTX v3 ships with the CUDA Toolkit and is header-only: no library to link.
 #if !defined(CADENCE_HAS_NVTX)
 #if defined(NVTX_DISABLE)
 #define CADENCE_HAS_NVTX 0
@@ -59,7 +56,7 @@
 #define CADENCE_DETAIL_CONCAT(a, b) CADENCE_DETAIL_CONCAT_IMPL(a, b)
 #define CADENCE_DETAIL_UNIQUE(prefix) CADENCE_DETAIL_CONCAT(prefix, __LINE__)
 
-// 4. Hot-path hints. A scope constructor is a handful of instructions wrapped around a CUDA call; it should never survive as an out-of-line function, and the "instrumentation is off" branch should never be the one the predictor learns.
+// Hot-path hints.
 #if defined(__GNUC__) || defined(__clang__)
 #define CADENCE_ALWAYS_INLINE inline __attribute__((always_inline))
 #define CADENCE_LIKELY(expression) __builtin_expect(!!(expression), 1)
