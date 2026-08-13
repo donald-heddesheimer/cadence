@@ -1,8 +1,5 @@
-// cadence — CSV emission and run provenance.
-//
-// Numbers come with caveats. Every report carries a header describing the
-// device, the clock state, and the warmup setting, so nobody quotes a
-// throttled run as gospel.
+// Numbers come with caveats.
+// Every report carries a header describing the device, the clock state, and the warmup setting
 #pragma once
 
 #include <fstream>
@@ -60,6 +57,11 @@ inline void WriteReportHeader(std::ostream& out, const Config& config, const Run
   out << "# clock_state: not locked by cadence; boost clocks drift run to run.\n";
   out << "#   lock with `nvidia-smi -lgc <mhz>` before comparing runs.\n";
   out << "# warmup_iterations_discarded_per_label: " << config.warmupIterations << "\n";
+  if (config.sampleEvery > 1) {
+    // Without this line the counts are unreadable: a 10000-iteration run reporting 1000 samples looks like a bug rather than a setting.
+    out << "# sample_every: " << config.sampleEvery << " -- one observation in "
+        << config.sampleEvery << " was measured; outliers between samples are not represented.\n";
+  }
   if (failedRecords > 0) {
     out << "# warning: " << failedRecords
         << " record(s) dropped -- event creation or elapsed-time query failed\n";

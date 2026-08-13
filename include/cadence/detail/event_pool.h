@@ -3,9 +3,16 @@
 // cudaEventCreate is far too expensive to call per scope, so events are
 // created once and handed back to a free list when a record is consumed.
 // Events are timing-enabled by design: cudaEventDisableTiming is only correct
-// for events used purely for dependency ordering.
+// for events used purely for dependency ordering, and it is not a shortcut
+// available here -- it is a tenth the cost precisely because it skips the
+// timestamp this library exists to read.
+//
+// This pool is the shared one, behind the registry's lock. Threads draw from
+// it in batches into a thread-local cache, so the lock is taken once per
+// refill rather than twice per scope.
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 #include "cadence/detail/platform.h"
@@ -39,8 +46,33 @@ class EventPool {
     return event;
   }
 
+  // Moves up to `count` events into `out`, creating whatever the free list cannot supply. Returns how many were added, which is short of `count` only when the runtime refuses to create events.
+  std::size_t AcquireInto(std::vector<cudaEvent_t>& out, std::size_t count) {
+    std::size_t added = 0;
+    while (added < count && !free_.empty()) {
+      out.push_back(free_.back());
+      free_.pop_back();
+      ++added;
+    }
+    while (added < count) {
+      cudaEvent_t event = nullptr;
+      if (cudaEventCreate(&event) != cudaSuccess) break;
+      ++liveCount_;
+      out.push_back(event);
+      ++added;
+    }
+    return added;
+  }
+
   void Release(cudaEvent_t event) {
     if (event) free_.push_back(event);
+  }
+
+  void ReleaseAll(std::vector<cudaEvent_t>& events) {
+    for (cudaEvent_t event : events) {
+      if (event) free_.push_back(event);
+    }
+    events.clear();
   }
 
   std::size_t LiveCount() const { return liveCount_; }

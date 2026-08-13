@@ -16,7 +16,6 @@
 // Scope: single GPU, CUDA runtime API, elapsed time only. For hardware
 // counters use `ncu`; for a system-wide timeline use `nsys` (cadence's NVTX
 // passthrough feeds it).
-
 #pragma once
 
 #include <cstdlib>
@@ -26,6 +25,7 @@
 #include <vector>
 
 #include "cadence/detail/config.h"
+#include "cadence/detail/labels.h"
 #include "cadence/detail/platform.h"
 #include "cadence/detail/registry.h"
 #include "cadence/detail/report.h"
@@ -37,11 +37,11 @@ namespace cadence {
 // Apply a configuration. Environment variables still win over whatever is set here; see detail/config.h for the list.
 inline void Configure(const Config& config) { detail::Registry::Instance().Configure(config); }
 
-inline const Config& GetConfig() { return detail::Registry::Instance().GetConfig(); }
+inline Config GetConfig() { return detail::Registry::Instance().GetConfig(); }
 
 // Consume pending records: wait on the recorded stop events, compute elapsed times, discard warmup, fold into per-label statistics.
 //
-// This synchronizes. Call it at a loop or frame boundary -- never between the scopes you are trying to measure.
+// This synchronizes. Call it at a loop or frame boundary -- never between the scopes you are trying to measure. It also closes every open stage chain.
 inline void Flush() { detail::Registry::Instance().Flush(); }
 
 // Per-label statistics for everything flushed so far. Device and host rows are reported separately; a device scope also yields a host row holding its CPU-issue time, so comparing the two shows launch-bound vs compute-bound.
@@ -51,6 +51,9 @@ inline std::vector<Stats> Snapshot() { return detail::Registry::Instance().Snaps
 inline void Reset() { detail::Registry::Instance().Reset(); }
 
 inline RunInfo QueryRunInfo() { return detail::QueryRunInfo(); }
+
+// Records dropped because event creation or an elapsed-time query failed.
+inline std::size_t FailedRecordCount() { return detail::Registry::Instance().FailedRecordCount(); }
 
 // Write the report to an already-open stream. Does not flush first.
 inline void WriteCsv(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
@@ -74,19 +77,31 @@ inline bool Report() {
 
 }  // namespace cadence
 
-// Prefer these over the classes: they are what -DCADENCE_DISABLE removes.
+// Prefer these over the classes: they are what -DCADENCE_DISABLE removes, and they are the only form that resolves a label once per call site rather than once per execution.
+//
+// The trailing sentinels give the stream argument a default without relying on __VA_OPT__, which is C++20, or on the ## comma-swallowing extension, which is not standard at all.
 
 #if CADENCE_ENABLED && CADENCE_HAS_CUDA
 // CADENCE_KERNEL("label")            -- times work on the default stream
 // CADENCE_KERNEL("label", stream)    -- times work on `stream`
-#define CADENCE_KERNEL(...) \
-  ::cadence::ScopedKernel CADENCE_DETAIL_UNIQUE(cadenceKernelScope_)(__VA_ARGS__)
+#define CADENCE_KERNEL(...) CADENCE_DETAIL_KERNEL_IMPL(__VA_ARGS__, 0, 0)
+#define CADENCE_DETAIL_KERNEL_IMPL(label, stream, ...)                                            \
+  ::cadence::ScopedKernel CADENCE_DETAIL_UNIQUE(cadenceKernelScope_)(CADENCE_DETAIL_LABEL(label), \
+                                                                     stream)
+
+// CADENCE_STAGE("label", stream) -- one event per stage instead of two, at the price of charging any gap on the stream to the stage that follows it. See ScopedStage in detail/scopes.h before reaching for it.
+#define CADENCE_STAGE(...) CADENCE_DETAIL_STAGE_IMPL(__VA_ARGS__, 0, 0)
+#define CADENCE_DETAIL_STAGE_IMPL(label, stream, ...)                                           \
+  ::cadence::ScopedStage CADENCE_DETAIL_UNIQUE(cadenceStageScope_)(CADENCE_DETAIL_LABEL(label), \
+                                                                   stream)
 #else
 #define CADENCE_KERNEL(...) ((void)0)
+#define CADENCE_STAGE(...) ((void)0)
 #endif
 
 #if CADENCE_ENABLED
-#define CADENCE_SCOPE(label) ::cadence::ScopedHost CADENCE_DETAIL_UNIQUE(cadenceHostScope_)(label)
+#define CADENCE_SCOPE(label) \
+  ::cadence::ScopedHost CADENCE_DETAIL_UNIQUE(cadenceHostScope_)(CADENCE_DETAIL_LABEL(label))
 #define CADENCE_FLUSH() ::cadence::Flush()
 #define CADENCE_REPORT() ::cadence::Report()
 #define CADENCE_CONFIGURE(config) ::cadence::Configure(config)

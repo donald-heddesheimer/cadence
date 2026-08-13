@@ -1,28 +1,38 @@
 // cadence — the deferred-flush registry.
 //
 // The hot path does as little as possible: record two events (or read a
-// steady_clock), then push a small POD under a mutex. Nothing synchronizes,
-// nothing allocates a string, nothing queries the device. All of the real work
+// steady_clock), then append a small POD to a thread-local buffer. Nothing
+// synchronizes, nothing allocates, nothing hashes a string, nothing queries the
+// device, and nothing touches a lock another thread wants. All of the real work
 // -- synchronizing events, computing elapsed times, discarding warmup,
 // aggregating statistics -- happens in Flush(), which the application calls at
 // a point where a synchronization is already acceptable.
 //
 // A profiler that serializes the pipeline is measuring itself.
+//
+// Flush() is a loop boundary, not a concurrent operation. It may be called from
+// any thread and it will collect every thread's records, but calling it while
+// another thread is inside a scope it is collecting is outside the contract --
+// with stage chaining that window can hand a thread an event that has already
+// gone back to the pool.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "cadence/detail/config.h"
+#include "cadence/detail/labels.h"
 #include "cadence/detail/platform.h"
 #include "cadence/detail/report.h"
 #include "cadence/detail/stats.h"
+#include "cadence/detail/thread_state.h"
 
 #if CADENCE_HAS_CUDA
 #include "cadence/detail/event_pool.h"
@@ -31,167 +41,212 @@
 namespace cadence {
 namespace detail {
 
-// Labels are stored as raw pointers and only copied into a std::string during Flush(). The documented contract is that a label outlives the Flush() that consumes it -- string literals, which is what the macros pass, always do.
-struct HostRecord {
-  const char* label;
-  double elapsedMs;
-};
-
-#if CADENCE_HAS_CUDA
-struct DeviceRecord {
-  const char* label;
-  cudaStream_t stream;
-  cudaEvent_t start;
-  cudaEvent_t stop;
-  // CPU time spent inside the scope, for launch-bound vs compute-bound comparison against elapsedMs.
-  double hostIssueMs;
-};
-#endif
-
-// Accumulated samples for one label, across every flush so far.
+// Accumulated samples for one label, across every flush so far. Indexed by LabelId, so finding it is an array subscript.
 struct LabelSamples {
   std::vector<double> deviceMs;
-  std::vector<double> hostMs;   // Host scopes, or CPU-issue for device scopes.
-  std::uint64_t seen = 0;       // Total observations, warmup included.
+  std::vector<double> hostMs;   // Host scopes, or CPU-issue time for device scopes.
+  std::uint64_t seen = 0;       // Observations kept for statistics, warmup included.
   std::uint64_t discarded = 0;  // Observations dropped as warmup.
   bool hasDevice = false;
-  bool hasHostIssue = false;
 };
 
 class Registry {
  public:
   static Registry& Instance() {
-    static Registry instance;
-    return instance;
+    // Leaked on purpose. Thread-local state, the atexit report and the CUDA runtime all unwind against each other at shutdown, and a registry that cannot be destroyed cannot be used after destruction.
+    static Registry* instance = new Registry();
+    return *instance;
   }
 
   Registry(const Registry&) = delete;
   Registry& operator=(const Registry&) = delete;
 
-  const Config& GetConfig() const { return config_; }
+  Config GetConfig() const {
+    std::lock_guard<std::mutex> lock(configMutex_);
+    return config_;
+  }
 
   void Configure(const Config& config) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(configMutex_);
     config_ = config;
     ApplyEnvironmentOverrides(config_);
+    PublishHotConfig(config_);
   }
 
-  bool IsEnabled() const { return config_.enabled; }
+  bool IsEnabled() const { return hotConfig.enabled.load(std::memory_order_relaxed); }
 
-  void RecordHost(const char* label, double elapsedMs) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pendingHost_.push_back(HostRecord{label, elapsedMs});
-  }
+  std::uint64_t FlushGeneration() const { return flushGeneration_.load(std::memory_order_relaxed); }
 
 #if CADENCE_HAS_CUDA
-  // Callers acquire events through the registry so the pool stays behind one lock. Returns nullptr when the runtime is out of events.
-  cudaEvent_t AcquireEvent() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return eventPool_.Acquire();
+  // Tops up a thread's private event cache. One lock per NUM_EVENTS_PER_REFILL scopes rather than two per scope.
+  void RefillEventCache(std::vector<cudaEvent_t>& cache) {
+    std::lock_guard<std::mutex> lock(poolMutex_);
+    eventPool_.AcquireInto(cache, NUM_EVENTS_PER_REFILL);
   }
 
-  void RecordDevice(const DeviceRecord& record) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pendingDevice_.push_back(record);
+  void ReturnEvents(std::vector<cudaEvent_t>& events) {
+    if (events.empty()) return;
+    std::lock_guard<std::mutex> lock(poolMutex_);
+    eventPool_.ReleaseAll(events);
+  }
+
+  // CUDA events ever created and not destroyed. A steady-state loop should settle on a constant: a number that climbs means events are being taken and never handed back.
+  std::size_t LiveEventCount() const {
+    std::lock_guard<std::mutex> lock(poolMutex_);
+    return eventPool_.LiveCount();
   }
 #endif
 
-  // Consumes every pending record. This is a synchronization point: it waits for the recorded stop events, which is why it belongs at a frame or loop boundary and never inside the measured region.
+  // Appends a host observation without a scope object. Interns on every call, so it is for tests and for callers who already have a duration in hand -- not for a loop.
+  void RecordHost(const char* label, double elapsedMs);
+
+  std::shared_ptr<ThreadState> RegisterThread() {
+    auto state = std::make_shared<ThreadState>();
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    threads_.push_back(state);
+    return state;
+  }
+
+  // Consumes every pending record from every thread. This is a synchronization point: it waits for the recorded stop events, which is why it belongs at a frame or loop boundary and never inside the measured region.
   void Flush() {
+    // Bumping first means a thread that starts a stage after this point opens a fresh chain rather than extending one whose events are about to be recycled.
+    flushGeneration_.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<std::shared_ptr<ThreadState>> blocks;
+    {
+      std::lock_guard<std::mutex> lock(threadsMutex_);
+      blocks = threads_;
+    }
+
     std::vector<HostRecord> hostBatch;
 #if CADENCE_HAS_CUDA
-    std::vector<DeviceRecord> deviceBatch;
+    // Kept per thread rather than concatenated: within one thread the records for a stream are in program order, hence in stream order, and that is what makes it sound to wait on only the last of them.
+    std::vector<std::vector<DeviceRecord>> deviceBatches;
+    deviceBatches.reserve(blocks.size());
 #endif
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      hostBatch.swap(pendingHost_);
+    for (const std::shared_ptr<ThreadState>& block : blocks) {
+      std::lock_guard<std::mutex> lock(block->mutex);
+      if (!block->pendingHost.empty()) {
+        hostBatch.insert(hostBatch.end(), block->pendingHost.begin(), block->pendingHost.end());
+        block->pendingHost.clear();
+      }
 #if CADENCE_HAS_CUDA
-      deviceBatch.swap(pendingDevice_);
+      if (!block->pendingDevice.empty()) {
+        deviceBatches.emplace_back();
+        deviceBatches.back().swap(block->pendingDevice);
+        block->pendingDevice.reserve(NUM_RECORDS_RESERVED);
+      }
 #endif
     }
 
 #if CADENCE_HAS_CUDA
-    // Two passes. First wait for every stop event, so the elapsed-time queries in the second pass never block. Events on one stream complete in record order, so this is usually a single real wait followed by no-ops.
-    for (const DeviceRecord& record : deviceBatch) {
-      if (record.stop) cudaEventSynchronize(record.stop);
-    }
-#endif
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-#if CADENCE_HAS_CUDA
-      for (const DeviceRecord& record : deviceBatch) {
-        float elapsedMs = 0.0f;
-        const bool valid =
-            record.start && record.stop &&
-            cudaEventElapsedTime(&elapsedMs, record.start, record.stop) == cudaSuccess;
-        if (valid) {
-          LabelSamples& samples = samples_[record.label];
-          samples.hasDevice = true;
-          samples.hasHostIssue = true;
-          if (KeepSample(samples)) {
-            samples.deviceMs.push_back(static_cast<double>(elapsedMs));
-            samples.hostMs.push_back(record.hostIssueMs);
+    // Events on a stream complete in the order they were recorded, so waiting on the last stop event of a stream implies every earlier one on that stream. The naive loop calls cudaEventSynchronize once per record; on an already-complete event that still costs ~140 ns of driver round trip, which for a five-stage iteration is most of the flush.
+    std::vector<cudaEvent_t> waits;
+    std::vector<cudaStream_t> seenStreams;
+    for (const std::vector<DeviceRecord>& batch : deviceBatches) {
+      seenStreams.clear();
+      for (std::size_t i = batch.size(); i > 0; --i) {
+        const DeviceRecord& record = batch[i - 1];
+        if (!record.stop) continue;
+        bool seen = false;
+        for (cudaStream_t stream : seenStreams) {
+          if (stream == record.stream) {
+            seen = true;
+            break;
           }
-        } else if (record.start || record.stop) {
-          ++failedRecords_;
         }
-        eventPool_.Release(record.start);
-        eventPool_.Release(record.stop);
+        if (seen) continue;
+        seenStreams.push_back(record.stream);
+        waits.push_back(record.stop);
+      }
+    }
+    for (cudaEvent_t event : waits) cudaEventSynchronize(event);
+
+    std::vector<cudaEvent_t> spent;
+#endif
+
+    // Read before taking samplesMutex_, so the only lock this function ever holds two of at once is none.
+    const unsigned warmup = WarmupIterations();
+    {
+      std::lock_guard<std::mutex> lock(samplesMutex_);
+#if CADENCE_HAS_CUDA
+      for (const std::vector<DeviceRecord>& batch : deviceBatches) {
+        for (const DeviceRecord& record : batch) {
+          float elapsedMs = 0.0f;
+          const bool valid =
+              record.start && record.stop &&
+              cudaEventElapsedTime(&elapsedMs, record.start, record.stop) == cudaSuccess;
+          if (valid) {
+            LabelSamples& samples = SamplesFor(record.label);
+            samples.hasDevice = true;
+            if (KeepSample(samples, warmup)) {
+              samples.deviceMs.push_back(static_cast<double>(elapsedMs));
+              samples.hostMs.push_back(static_cast<double>(record.hostIssueNs) * 1e-6);
+            }
+          } else if (record.start || record.stop) {
+            ++failedRecords_;
+          }
+          if (record.ownsStart) spent.push_back(record.start);
+          spent.push_back(record.stop);
+        }
       }
 #endif
       for (const HostRecord& record : hostBatch) {
-        LabelSamples& samples = samples_[record.label];
-        if (KeepSample(samples)) samples.hostMs.push_back(record.elapsedMs);
+        LabelSamples& samples = SamplesFor(record.label);
+        if (KeepSample(samples, warmup)) {
+          samples.hostMs.push_back(static_cast<double>(record.elapsedNs) * 1e-6);
+        }
       }
     }
+
+#if CADENCE_HAS_CUDA
+    ReturnEvents(spent);
+#endif
+    PruneRetiredThreads();
   }
 
   // Flush() first if you want the current loop's records included.
   std::vector<Stats> Snapshot() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    const std::vector<std::string> names = LabelTable::Instance().Names();
+    std::lock_guard<std::mutex> lock(samplesMutex_);
     std::vector<Stats> results;
     results.reserve(samples_.size());
-    for (const auto& entry : samples_) {
-      const LabelSamples& samples = entry.second;
+    for (std::size_t id = 0; id < samples_.size(); ++id) {
+      const LabelSamples& samples = samples_[id];
+      if (samples.deviceMs.empty() && samples.hostMs.empty()) continue;
+      const std::string& name = id < names.size() ? names[id] : std::string();
       if (samples.hasDevice) {
         results.push_back(
-            ComputeStats(entry.first, ScopeKind::Device, samples.deviceMs, samples.discarded));
+            ComputeStats(name, ScopeKind::Device, samples.deviceMs, samples.discarded));
       }
       if (!samples.hostMs.empty()) {
         // For a device scope this row is the CPU-issue side of the same label: compare it against the device row to see launch-bound vs compute-bound.
-        results.push_back(
-            ComputeStats(entry.first, ScopeKind::Host, samples.hostMs, samples.discarded));
+        results.push_back(ComputeStats(name, ScopeKind::Host, samples.hostMs, samples.discarded));
       }
     }
     return results;
   }
 
   void Reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(samplesMutex_);
     samples_.clear();
     failedRecords_ = 0;
   }
 
   std::size_t FailedRecordCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(samplesMutex_);
     return failedRecords_;
   }
 
   // Suppresses the exit-time write: the application reported explicitly, and that report was taken while the CUDA runtime was certainly still alive.
   void MarkReported() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(configMutex_);
     reported_ = true;
   }
 
   void WriteTo(std::ostream& out) const {
-    Config configCopy;
-    std::size_t failed = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      configCopy = config_;
-      failed = failedRecords_;
-    }
+    Config configCopy = GetConfig();
+    std::size_t failed = FailedRecordCount();
     WriteReportHeader(out, configCopy, QueryRunInfo(), failed);
     WriteStatsCsv(out, Snapshot());
   }
@@ -199,7 +254,8 @@ class Registry {
  private:
   Registry() {
     ApplyEnvironmentOverrides(config_);
-    // Last-resort output for applications that never call Report(). It runs before this object is destroyed, because atexit handlers and static destructors unwind in one interleaved reverse-order sequence and this registration happens after construction.
+    PublishHotConfig(config_);
+    // Last-resort output for applications that never call Report(). It runs before this object would be destroyed -- which it never is -- because atexit handlers and static destructors unwind in one interleaved reverse-order sequence and this registration happens after construction.
     std::atexit(&Registry::AtExitHandler);
   }
 
@@ -208,7 +264,7 @@ class Registry {
     const Config config = registry.GetConfig();
     if (!config.writeOnExit || config.outputPath.empty()) return;
     {
-      std::lock_guard<std::mutex> lock(registry.mutex_);
+      std::lock_guard<std::mutex> lock(registry.configMutex_);
       if (registry.reported_) return;
     }
     // The CUDA runtime may already be shutting down; Flush() tolerates that and the report simply loses whatever was still pending.
@@ -217,27 +273,117 @@ class Registry {
     if (out) registry.WriteTo(out);
   }
 
-  // Warmup discard. Called with mutex_ held; increments the per-label counter and reports whether this observation should contribute to statistics.
-  bool KeepSample(LabelSamples& samples) {
+  unsigned WarmupIterations() const {
+    std::lock_guard<std::mutex> lock(configMutex_);
+    return config_.warmupIterations;
+  }
+
+  // Called with samplesMutex_ held.
+  LabelSamples& SamplesFor(LabelId id) {
+    if (id >= samples_.size()) samples_.resize(id + 1);
+    return samples_[id];
+  }
+
+  // Warmup discard. Called with samplesMutex_ held; increments the per-label counter and reports whether this observation should contribute to statistics.
+  bool KeepSample(LabelSamples& samples, unsigned warmup) {
     const std::uint64_t index = samples.seen++;
-    if (index < config_.warmupIterations) {
+    if (index < warmup) {
       samples.discarded = index + 1;
       return false;
     }
     return true;
   }
 
-  mutable std::mutex mutex_;
-  Config config_;
-  std::vector<HostRecord> pendingHost_;
-  std::map<std::string, LabelSamples> samples_;
-  std::size_t failedRecords_ = 0;
-  bool reported_ = false;
+  void PruneRetiredThreads() {
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < threads_.size(); ++i) {
+      const std::shared_ptr<ThreadState>& state = threads_[i];
+      bool drop = false;
+      {
+        std::lock_guard<std::mutex> stateLock(state->mutex);
+        drop = state->retired && state->pendingHost.empty();
 #if CADENCE_HAS_CUDA
-  std::vector<DeviceRecord> pendingDevice_;
+        drop = drop && state->pendingDevice.empty();
+#endif
+      }
+      if (!drop) threads_[kept++] = threads_[i];
+    }
+    threads_.resize(kept);
+  }
+
+  mutable std::mutex configMutex_;
+  Config config_;
+  bool reported_ = false;
+
+  mutable std::mutex samplesMutex_;
+  std::vector<LabelSamples> samples_;
+  std::size_t failedRecords_ = 0;
+
+  std::mutex threadsMutex_;
+  std::vector<std::shared_ptr<ThreadState>> threads_;
+
+  std::atomic<std::uint64_t> flushGeneration_{1};
+
+#if CADENCE_HAS_CUDA
+  mutable std::mutex poolMutex_;
   EventPool eventPool_;
 #endif
 };
+
+// Holds the calling thread's block alive and marks it retired on the way out. Retirement is a flag rather than a removal because Flush() may be reading the block at that moment; the registry drops it at the next flush that finds it drained.
+class ThreadStateHandle {
+ public:
+  ThreadStateHandle() : state_(Registry::Instance().RegisterThread()) {}
+
+  ~ThreadStateHandle() {
+#if CADENCE_HAS_CUDA
+    Registry::Instance().ReturnEvents(state_->eventCache);
+#endif
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->retired = true;
+  }
+
+  ThreadState& Get() const { return *state_; }
+
+ private:
+  std::shared_ptr<ThreadState> state_;
+};
+
+CADENCE_ALWAYS_INLINE ThreadState& TlsState() {
+  static thread_local ThreadStateHandle handle;
+  return handle.Get();
+}
+
+// Defined out of line because it needs TlsState(), which needs Registry to be a complete type.
+inline void Registry::RecordHost(const char* label, double elapsedMs) {
+  const LabelHandle handle = LabelTable::Instance().Intern(label);
+  ThreadState& state = TlsState();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.pendingHost.push_back(HostRecord{handle.id, static_cast<std::int64_t>(elapsedMs * 1e6)});
+}
+
+// One observation in every `sampleEvery`. The counter lives in the label handle, so this costs an increment on a cache line only this label touches; the common case is sampleEvery == 1 and a branch the predictor gets right every time.
+CADENCE_ALWAYS_INLINE bool ShouldSample(const LabelHandle& handle) {
+  const unsigned every = hotConfig.sampleEvery.load(std::memory_order_relaxed);
+  if (CADENCE_LIKELY(every <= 1)) return true;
+  if (!handle.observations) return true;
+  const std::uint64_t index = handle.observations->fetch_add(1, std::memory_order_relaxed);
+  return (index % every) == 0;
+}
+
+#if CADENCE_HAS_CUDA
+// Pops one event from the thread's private cache, refilling from the shared pool when it runs dry. Returns nullptr only if the runtime will not create events, which callers treat as "this scope goes unmeasured" rather than as fatal.
+CADENCE_ALWAYS_INLINE cudaEvent_t TakeEvent(ThreadState& state) {
+  if (CADENCE_UNLIKELY(state.eventCache.empty())) {
+    Registry::Instance().RefillEventCache(state.eventCache);
+    if (state.eventCache.empty()) return nullptr;
+  }
+  cudaEvent_t event = state.eventCache.back();
+  state.eventCache.pop_back();
+  return event;
+}
+#endif
 
 }  // namespace detail
 }  // namespace cadence

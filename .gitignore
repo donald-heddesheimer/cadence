@@ -1,5 +1,4 @@
-# A clone of cadence is just the headers. Everything needed to develop it --
-# examples, tests, working notes -- lives in dev/ and stays local.
+# Working notes that are not part of the published library.
 dev/
 
 build/

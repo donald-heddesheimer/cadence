@@ -12,7 +12,7 @@ namespace detail {
 
 class NvtxRange {
  public:
-  explicit NvtxRange(const char* label, bool enabled) : active_(false) {
+  explicit NvtxRange(const char* label, bool enabled) {
 #if CADENCE_HAS_NVTX
     if (enabled && label) {
       nvtxRangePushA(label);
@@ -34,7 +34,10 @@ class NvtxRange {
   NvtxRange& operator=(const NvtxRange&) = delete;
 
  private:
-  bool active_;
+  // Declared only when there is something to track. Keeping it unconditionally costs a -Wunused-private-field warning in every build without NVTX, and a header-only library has no business adding warnings to someone else's build.
+#if CADENCE_HAS_NVTX
+  bool active_ = false;
+#endif
 };
 
 }  // namespace detail

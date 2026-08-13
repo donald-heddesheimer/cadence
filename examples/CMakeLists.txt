@@ -1,0 +1,3 @@
+add_executable(cadence_example_loop loop_saxpy.cu)
+target_link_libraries(cadence_example_loop PRIVATE cadence::cadence)
+set_target_properties(cadence_example_loop PROPERTIES CUDA_STANDARD 17)

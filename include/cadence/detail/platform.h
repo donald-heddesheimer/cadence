@@ -58,3 +58,18 @@
 #define CADENCE_DETAIL_CONCAT_IMPL(a, b) a##b
 #define CADENCE_DETAIL_CONCAT(a, b) CADENCE_DETAIL_CONCAT_IMPL(a, b)
 #define CADENCE_DETAIL_UNIQUE(prefix) CADENCE_DETAIL_CONCAT(prefix, __LINE__)
+
+// 4. Hot-path hints. A scope constructor is a handful of instructions wrapped around a CUDA call; it should never survive as an out-of-line function, and the "instrumentation is off" branch should never be the one the predictor learns.
+#if defined(__GNUC__) || defined(__clang__)
+#define CADENCE_ALWAYS_INLINE inline __attribute__((always_inline))
+#define CADENCE_LIKELY(expression) __builtin_expect(!!(expression), 1)
+#define CADENCE_UNLIKELY(expression) __builtin_expect(!!(expression), 0)
+#elif defined(_MSC_VER)
+#define CADENCE_ALWAYS_INLINE __forceinline
+#define CADENCE_LIKELY(expression) (expression)
+#define CADENCE_UNLIKELY(expression) (expression)
+#else
+#define CADENCE_ALWAYS_INLINE inline
+#define CADENCE_LIKELY(expression) (expression)
+#define CADENCE_UNLIKELY(expression) (expression)
+#endif
