@@ -1,0 +1,16 @@
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++17
+
+# Code wraps at 100. Comments do not wrap at all: ReflowComments leaves prose
+# lines exactly as written, however long, so an explanation can be one line
+# instead of an artificially chopped paragraph.
+ColumnLimit: 100
+ReflowComments: false
+
+DerivePointerAlignment: false
+PointerAlignment: Left
+# This library is mostly one-line forwarders (`inline void Flush() { ... }`);
+# keeping them on one line is the point of them.
+AllowShortFunctionsOnASingleLine: All
+IndentPPDirectives: None

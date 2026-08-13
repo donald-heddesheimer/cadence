@@ -1,0 +1,17 @@
+# A clone of cadence is just the headers. Everything needed to develop it --
+# examples, tests, working notes -- lives in dev/ and stays local.
+dev/
+
+build/
+build-*/
+cmake-build-*/
+
+# Reports written by the examples.
+cadence.csv
+*.nsys-rep
+*.qdrep
+
+.cache/
+compile_commands.json
+.vscode/
+.idea/
