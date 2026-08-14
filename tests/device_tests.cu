@@ -242,6 +242,106 @@ namespace {
         ResetLibrary(0, 1);
     }
 
+    // Chained stages borrow each other's events, so sampling has to thin whole chains rather than individual stages. Before this was handled, ScopedStage consulted no sampling state at all and CADENCE_STAGE quietly recorded every iteration no matter what sampleEvery said.
+    void TestStageSamplingThinsWholeChains(float* sink, cudaStream_t stream) {
+        ResetLibrary(0, 4);
+        for (int i = 0; i < 100; ++i) {
+            {
+                CADENCE_STAGE("staged-a", stream);
+                Spin<<<8, 64, 0, stream>>>(sink, 64);
+            }
+            {
+                CADENCE_STAGE("staged-b", stream);
+                Spin<<<8, 64, 0, stream>>>(sink, 64);
+            }
+            cadence::Flush();
+        }
+        const auto snapshot = cadence::Snapshot();
+        const std::size_t first = CountOf(snapshot, "staged-a", cadence::ScopeKind::Device);
+        const std::size_t second = CountOf(snapshot, "staged-b", cadence::ScopeKind::Device);
+        Check(first == 25, "sampleEvery=4 measured 25 of 100 chained iterations");
+        // The two stages have to agree exactly: a chain that kept one stage and dropped the other would leave the survivor measuring itself plus the gap where its neighbour used to be.
+        Check(first == second, "both stages of a chain were kept or dropped together");
+        ResetLibrary(0, 1);
+    }
+
+    // Recording into a capturing stream does not merely produce a wrong number. cudaEventRecord succeeds, then every later query against the event fails, and a flush issued while capture is still open poisons the capture outright: cudaStreamEndCapture returns an error and hands back a null graph. The scope has to stand down instead.
+    void TestStreamCaptureIsRefusedRatherThanCorrupted(float* sink, cudaStream_t stream) {
+        ResetLibrary(0, 1);
+        cudaGraph_t graph = nullptr;
+        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess,
+              "capture began");
+        {
+            CADENCE_KERNEL("captured-kernel", stream);
+            Spin<<<8, 64, 0, stream>>>(sink, 64);
+        }
+        {
+            CADENCE_STAGE("captured-stage", stream);
+            Spin<<<8, 64, 0, stream>>>(sink, 64);
+        }
+        const cudaError_t ended = cudaStreamEndCapture(stream, &graph);
+        Check(ended == cudaSuccess, "cudaStreamEndCapture succeeded despite the scopes inside it");
+        Check(graph != nullptr, "the application still got its graph back");
+
+        cadence::Flush();
+        const auto snapshot = cadence::Snapshot();
+        Check(CountOf(snapshot, "captured-kernel", cadence::ScopeKind::Device) == 0 &&
+                  CountOf(snapshot, "captured-stage", cadence::ScopeKind::Device) == 0,
+              "no measurements were invented for the captured region");
+        Check(cadence::CapturedScopeCount() >= 2, "the skipped scopes were counted and reported");
+        Check(cadence::FailedRecordCount() == 0,
+              "standing down left no broken records behind");
+
+        if (graph) cudaGraphDestroy(graph);
+        cudaGetLastError();
+        ResetLibrary(0, 1);
+    }
+
+    // The damaging arrangement, and not a contrived one: a loop body that already ends in CADENCE_FLUSH, wrapped in a capture. The flush waits on whatever the scopes recorded, and waiting on an event last recorded in a capturing stream invalidates the capture, so cudaStreamEndCapture fails and the application is handed a null graph. Instrumentation that breaks the program it is measuring is the one outcome worth a test of its own.
+    void TestFlushInsideCaptureLeavesTheGraphIntact(float* sink, cudaStream_t stream) {
+        ResetLibrary(0, 1);
+        cudaGraph_t graph = nullptr;
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        {
+            CADENCE_KERNEL("captured-then-flushed", stream);
+            Spin<<<8, 64, 0, stream>>>(sink, 64);
+        }
+        cadence::Flush();
+        const cudaError_t ended = cudaStreamEndCapture(stream, &graph);
+        Check(ended == cudaSuccess, "a flush inside the capture region did not invalidate it");
+        Check(graph != nullptr, "the graph survived a flush inside its own capture");
+        if (graph) cudaGraphDestroy(graph);
+        cudaGetLastError();
+        ResetLibrary(0, 1);
+    }
+
+    // Bowing out of a captured region must not leak the events the scope had already taken, or a loop that captures every iteration drains the pool.
+    void TestCaptureDoesNotLeakEvents(float* sink, cudaStream_t stream) {
+        ResetLibrary(0, 1);
+        for (int i = 0; i < 20; ++i) {
+            CADENCE_KERNEL("warm", stream);
+            Spin<<<8, 64, 0, stream>>>(sink, 64);
+        }
+        cadence::Flush();
+        const std::size_t before = cadence::detail::Registry::Instance().LiveEventCount();
+
+        for (int i = 0; i < 50; ++i) {
+            cudaGraph_t graph = nullptr;
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            {
+                CADENCE_KERNEL("captured-loop", stream);
+                Spin<<<8, 64, 0, stream>>>(sink, 64);
+            }
+            cudaStreamEndCapture(stream, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            cadence::Flush();
+        }
+        const std::size_t after = cadence::detail::Registry::Instance().LiveEventCount();
+        Check(after == before, "fifty captured iterations created no new events");
+        cudaGetLastError();
+        ResetLibrary(0, 1);
+    }
+
     void TestConcurrentThreadsRecordDeviceWork(float* sink) {
         ResetLibrary(0, 1);
         constexpr int NUM_THREADS_USED = 4;
@@ -294,6 +394,10 @@ int main() {
     TestEventPoolSettles(sink, stream);
     TestChainsArePerStream(sink, stream, other);
     TestSamplingKeepsEveryNth(sink, stream);
+    TestStageSamplingThinsWholeChains(sink, stream);
+    TestStreamCaptureIsRefusedRatherThanCorrupted(sink, stream);
+    TestFlushInsideCaptureLeavesTheGraphIntact(sink, stream);
+    TestCaptureDoesNotLeakEvents(sink, stream);
     TestConcurrentThreadsRecordDeviceWork(sink);
 
     cudaStreamDestroy(other);

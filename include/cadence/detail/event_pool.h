@@ -3,9 +3,12 @@
 // cudaEventCreate is far too expensive to call per scope, so events are created once and handed back to a free list when a record is consumed. Events are timing-enabled by design: cudaEventDisableTiming is only correct for events used purely for dependency ordering, and it is not a shortcut available here -- it is a tenth the cost precisely because it skips the timestamp this library exists to read.
 //
 // This pool is the shared one, behind the registry's lock. Threads draw from it in batches into a thread-local cache, so the lock is taken once per refill rather than twice per scope.
+//
+// A CUDA event belongs to the device that was current when it was created, and neither cudaEventRecord against a stream on another device nor cudaEventElapsedTime across a device boundary is legal. One pool per device rather than one pool overall is therefore not a refinement; it is what keeps a two-GPU process from recording against handles the driver will reject.
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "cadence/detail/platform.h"
@@ -72,6 +75,28 @@ namespace cadence {
        private:
         std::vector<cudaEvent_t> free_;
         std::size_t liveCount_ = 0;
+    };
+
+    // One EventPool per device ordinal, grown on demand. Held by pointer so that adding a device never moves the pools already in use.
+    class DeviceEventPools {
+       public:
+        EventPool& For(int device) {
+            const std::size_t index = device < 0 ? 0 : static_cast<std::size_t>(device);
+            if (index >= pools_.size()) pools_.resize(index + 1);
+            if (!pools_[index]) pools_[index] = std::unique_ptr<EventPool>(new EventPool());
+            return *pools_[index];
+        }
+
+        std::size_t LiveCount() const {
+            std::size_t total = 0;
+            for (const std::unique_ptr<EventPool>& pool : pools_) {
+                if (pool) total += pool->LiveCount();
+            }
+            return total;
+        }
+
+       private:
+        std::vector<std::unique_ptr<EventPool>> pools_;
     };
 
     }  // namespace detail

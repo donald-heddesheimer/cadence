@@ -49,6 +49,15 @@ namespace cadence {
     // Host spans dropped because the monotonic clock did not advance across them. Nonzero says the machine's clock is unreliable under load, not that the measured code was fast.
     inline std::size_t StalledClockCount() { return detail::Registry::Instance().StalledClockCount(); }
 
+    // Scopes that recorded nothing because their stream was capturing into a CUDA graph. Always zero in a build without CUDA.
+    inline std::size_t CapturedScopeCount() {
+#if CADENCE_HAS_CUDA
+        return detail::Registry::Instance().CapturedScopeCount();
+#else
+        return 0;
+#endif
+    }
+
     // Render the report to an already-open stream. Does not flush first.
     inline void WriteReport(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
 

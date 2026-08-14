@@ -29,8 +29,8 @@ namespace cadence {
 
     // Accumulated samples for one label, across every flush so far. Indexed by LabelId.
     struct LabelSamples {
-        std::vector<double> deviceMs;
-        std::vector<double> hostMs;   // Host scopes, or CPU-issue time for device scopes.
+        SampleSet device;
+        SampleSet host;               // Host scopes, or CPU-issue time for device scopes.
         std::uint64_t seen = 0;       // Observations kept for statistics, warmup included.
         std::uint64_t discarded = 0;  // Observations dropped as warmup.
         bool hasDevice = false;
@@ -64,23 +64,27 @@ namespace cadence {
         std::uint64_t FlushGeneration() const { return flushGeneration_.load(std::memory_order_relaxed); }
 
 #if CADENCE_HAS_CUDA
-        // Tops up a thread's private event cache. One lock per NUM_EVENTS_PER_REFILL scopes rather than two per scope.
-        void RefillEventCache(std::vector<cudaEvent_t>& cache) {
+        // Tops up a thread's private event cache. One lock per NUM_EVENTS_PER_REFILL scopes rather than two per scope. The caller's current device must be `device`, since that is what cudaEventCreate binds a new event to.
+        void RefillEventCache(int device, std::vector<cudaEvent_t>& cache) {
             std::lock_guard<std::mutex> lock(poolMutex_);
-            eventPool_.AcquireInto(cache, NUM_EVENTS_PER_REFILL);
+            eventPools_.For(device).AcquireInto(cache, NUM_EVENTS_PER_REFILL);
         }
 
-        void ReturnEvents(std::vector<cudaEvent_t>& events) {
+        void ReturnEvents(int device, std::vector<cudaEvent_t>& events) {
             if (events.empty()) return;
             std::lock_guard<std::mutex> lock(poolMutex_);
-            eventPool_.ReleaseAll(events);
+            eventPools_.For(device).ReleaseAll(events);
         }
 
-        // CUDA events ever created and not destroyed. A steady-state loop should settle on a constant: a number that climbs means events are being taken and never handed back.
+        // CUDA events ever created and not destroyed, across every device. A steady-state loop should settle on a constant: a number that climbs means events are being taken and never handed back.
         std::size_t LiveEventCount() const {
             std::lock_guard<std::mutex> lock(poolMutex_);
-            return eventPool_.LiveCount();
+            return eventPools_.LiveCount();
         }
+
+        // Scopes that recorded nothing because their stream was capturing into a CUDA graph. Read without the lock: it is a diagnostic count, and the report is rendered long after the loop that incremented it.
+        void NoteCapturedScope() { capturedScopes_.fetch_add(1, std::memory_order_relaxed); }
+        std::size_t CapturedScopeCount() const { return capturedScopes_.load(std::memory_order_relaxed); }
 #endif
 
         // Appends a host observation without a scope object. Interns on every call, so it is for tests and for callers who already have a duration in hand. 
@@ -148,11 +152,14 @@ namespace cadence {
             }
             for (cudaEvent_t event : waits) cudaEventSynchronize(event);
 
-            std::vector<cudaEvent_t> spent;
+            // Grouped by the device that created them, because that is the only pool an event may be handed back to.
+            std::vector<std::vector<cudaEvent_t>> spentByDevice;
 #endif
 
             // Read before taking samplesMutex_, so the only lock this function ever holds two of at once is none.
             const unsigned warmup = WarmupIterations();
+            const double budgetMs = hotConfig.budgetMs.load(std::memory_order_relaxed);
+            const std::size_t capacity = hotConfig.maxSamplesPerLabel.load(std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lock(samplesMutex_);
 #if CADENCE_HAS_CUDA
@@ -166,10 +173,10 @@ namespace cadence {
                             LabelSamples& samples = SamplesFor(record.label);
                             samples.hasDevice = true;
                             if (KeepSample(samples, warmup)) {
-                                samples.deviceMs.push_back(static_cast<double>(elapsedMs));
+                                samples.device.Add(static_cast<double>(elapsedMs), budgetMs, capacity);
                                 // The GPU figure came from CUDA events and stands on its own; only the host half is dropped when the clock did not move, so a stalled clock costs you the issue-time row and nothing else.
                                 if (record.hostIssueNs > 0) {
-                                    samples.hostMs.push_back(static_cast<double>(record.hostIssueNs) * 1e-6);
+                                    samples.host.Add(static_cast<double>(record.hostIssueNs) * 1e-6, budgetMs, capacity);
                                 } else {
                                     ++stalledClockRecords_;
                                 }
@@ -177,8 +184,10 @@ namespace cadence {
                         } else if (record.start || record.stop) {
                             ++failedRecords_;
                         }
-                        if (record.ownsStart) spent.push_back(record.start);
-                        spent.push_back(record.stop);
+                        const std::size_t index = record.device < 0 ? 0 : static_cast<std::size_t>(record.device);
+                        if (index >= spentByDevice.size()) spentByDevice.resize(index + 1);
+                        if (record.ownsStart && record.start) spentByDevice[index].push_back(record.start);
+                        if (record.stop) spentByDevice[index].push_back(record.stop);
                     }
                 }
 #endif
@@ -187,7 +196,7 @@ namespace cadence {
                     LabelSamples& samples = SamplesFor(record.label);
                     if (KeepSample(samples, warmup)) {
                         if (record.elapsedNs > 0) {
-                            samples.hostMs.push_back(static_cast<double>(record.elapsedNs) * 1e-6);
+                            samples.host.Add(static_cast<double>(record.elapsedNs) * 1e-6, budgetMs, capacity);
                         } else {
                             ++stalledClockRecords_;
                         }
@@ -196,7 +205,9 @@ namespace cadence {
             }
 
 #if CADENCE_HAS_CUDA
-            ReturnEvents(spent);
+            for (std::size_t device = 0; device < spentByDevice.size(); ++device) {
+                ReturnEvents(static_cast<int>(device), spentByDevice[device]);
+            }
 #endif
             PruneRetiredThreads();
         }
@@ -214,22 +225,25 @@ namespace cadence {
             results.reserve(samples_.size());
             for (std::size_t id = 0; id < samples_.size(); ++id) {
                 const LabelSamples& samples = samples_[id];
-                if (samples.deviceMs.empty() && samples.hostMs.empty()) continue;
+                if (samples.device.Empty() && samples.host.Empty()) continue;
                 const std::string& name = id < names.size() ? names[id] : std::string();
                 if (samples.hasDevice) {
                     const double budget = target.Matches(id, ScopeKind::Device) ? config.budgetMs : 0.0;
-                    results.push_back(ComputeStats(name, ScopeKind::Device, samples.deviceMs, samples.discarded, budget));
+                    results.push_back(ComputeStatsFromSet(name, ScopeKind::Device, samples.device, samples.discarded, budget));
                 }
-                if (!samples.hostMs.empty()) {
+                if (!samples.host.Empty()) {
                     // For a device scope this row is the CPU-issue side of the same label: compare it against the device row to see launch-bound vs compute-bound.
                     const double budget = target.Matches(id, ScopeKind::Host) ? config.budgetMs : 0.0;
-                    results.push_back(ComputeStats(name, ScopeKind::Host, samples.hostMs, samples.discarded, budget));
+                    results.push_back(ComputeStatsFromSet(name, ScopeKind::Host, samples.host, samples.discarded, budget));
                 }
             }
             return results;
         }
 
         void Reset() {
+#if CADENCE_HAS_CUDA
+            capturedScopes_.store(0, std::memory_order_relaxed);
+#endif
             std::lock_guard<std::mutex> lock(samplesMutex_);
             samples_.clear();
             failedRecords_ = 0;
@@ -255,7 +269,12 @@ namespace cadence {
 
         void WriteTo(std::ostream& out) const {
             const Config configCopy = GetConfig();
-            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount());
+#if CADENCE_HAS_CUDA
+            const std::size_t captured = CapturedScopeCount();
+#else
+            const std::size_t captured = 0;
+#endif
+            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount(), captured);
         }
 
        private:
@@ -310,7 +329,7 @@ namespace cadence {
                     const LabelSamples& samples = samples_[id];
                     if (samples.hasDevice) {
                         target = BudgetTarget{true, id, ScopeKind::Device};
-                    } else if (!samples.hostMs.empty()) {
+                    } else if (!samples.host.Empty()) {
                         target = BudgetTarget{true, id, ScopeKind::Host};
                     }
                     return target;
@@ -321,7 +340,7 @@ namespace cadence {
             std::size_t hostOnlyCount = 0;
             for (std::size_t id = 0; id < samples_.size(); ++id) {
                 const LabelSamples& samples = samples_[id];
-                if (samples.hasDevice || samples.hostMs.empty()) continue;
+                if (samples.hasDevice || samples.host.Empty()) continue;
                 ++hostOnlyCount;
                 target = BudgetTarget{true, id, ScopeKind::Host};
             }
@@ -329,9 +348,16 @@ namespace cadence {
             return target;
         }
 
-        // Called with samplesMutex_ held.
+        // Called with samplesMutex_ held. Each set's reservoir is seeded from the label it belongs to, so which observations survive a capped run is reproducible from one run to the next.
         LabelSamples& SamplesFor(LabelId id) {
-            if (id >= samples_.size()) samples_.resize(id + 1);
+            if (id >= samples_.size()) {
+                const std::size_t first = samples_.size();
+                samples_.resize(id + 1);
+                for (std::size_t i = first; i <= id; ++i) {
+                    samples_[i].device.rngState = 0x9E3779B97F4A7C15ULL * (i + 1);
+                    samples_[i].host.rngState = 0xBF58476D1CE4E5B9ULL * (i + 1);
+                }
+            }
             return samples_[id];
         }
 
@@ -379,7 +405,8 @@ namespace cadence {
 
 #if CADENCE_HAS_CUDA
         mutable std::mutex poolMutex_;
-        EventPool eventPool_;
+        DeviceEventPools eventPools_;
+        std::atomic<std::size_t> capturedScopes_{0};
 #endif
     };
 
@@ -390,7 +417,9 @@ namespace cadence {
 
         ~ThreadStateHandle() {
 #if CADENCE_HAS_CUDA
-            Registry::Instance().ReturnEvents(state_->eventCache);
+            for (EventCache& cache : state_->eventCaches) {
+                Registry::Instance().ReturnEvents(cache.device, cache.events);
+            }
 #endif
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->retired = true;
@@ -425,15 +454,56 @@ namespace cadence {
     }
 
 #if CADENCE_HAS_CUDA
-    // Pops one event from the thread's private cache, refilling from the shared pool when it runs dry. Returns nullptr only if the runtime will not create events, which callers treat as "this scope goes unmeasured" rather than as fatal.
-    CADENCE_ALWAYS_INLINE cudaEvent_t TakeEvent(ThreadState& state) {
-        if (CADENCE_UNLIKELY(state.eventCache.empty())) {
-            Registry::Instance().RefillEventCache(state.eventCache);
-            if (state.eventCache.empty()) return nullptr;
+    // The device a scope's events must be created on, which is the one its kernel launch will go to. Measured at 20.6 ns on an RTX A4000, against 1490 ns for the cudaEventRecord it protects.
+    CADENCE_ALWAYS_INLINE int CurrentDevice() {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 0;
+        return device;
+    }
+
+    // True when nothing may be recorded on this stream because it is being captured into a CUDA graph.
+    //
+    // Recording anyway is not a matter of collecting a wrong number. cudaEventRecord succeeds during capture, but the event is baked into the graph rather than executed, and from then on every cudaEventSynchronize and cudaEventElapsedTime against it fails. Flushing while capture is still open poisons the capture outright: cudaStreamEndCapture then returns an error and hands the application back a null graph. Flushing after it closes leaves the graph intact but the events permanently unreadable, and recycling one into the pool hands an unrelated scope a handle that the instantiated graph silently re-records on every replay. Measured at 39.5 ns per check.
+    CADENCE_ALWAYS_INLINE bool StreamIsCapturing(cudaStream_t stream) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        if (CADENCE_UNLIKELY(cudaStreamIsCapturing(stream, &status) != cudaSuccess)) {
+            // The legacy default stream reports cudaErrorStreamCaptureImplicit while any other stream captures in global mode, so a failure here means capture is in play just as surely as a positive status does. Clear it rather than leaving our own probe as the error the application reads next.
+            cudaGetLastError();
+            return true;
         }
-        cudaEvent_t event = state.eventCache.back();
-        state.eventCache.pop_back();
+        return status != cudaStreamCaptureStatusNone;
+    }
+
+    // Pops one event from the thread's private cache for `device`, refilling from that device's pool when it runs dry. Returns nullptr only if the runtime will not create events, which callers treat as "this scope goes unmeasured" rather than as fatal.
+    CADENCE_ALWAYS_INLINE cudaEvent_t TakeEvent(ThreadState& state, int device) {
+        std::vector<cudaEvent_t>& cache = state.CacheFor(device);
+        if (CADENCE_UNLIKELY(cache.empty())) {
+            Registry::Instance().RefillEventCache(device, cache);
+            if (cache.empty()) return nullptr;
+        }
+        cudaEvent_t event = cache.back();
+        cache.pop_back();
         return event;
+    }
+
+    // Hands an unused event straight back to the thread's own cache. No lock, because the cache is private to this thread.
+    CADENCE_ALWAYS_INLINE void GiveBackEvent(ThreadState& state, int device, cudaEvent_t event) {
+        if (event) state.CacheFor(device).push_back(event);
+    }
+
+    // Sampling decision for a chained stage, made once per stream per flush generation and reused by every stage in that chain.
+    //
+    // ScopedStage borrows its predecessor's stop event, so the stages of one chain are not independent observations and cannot be thinned independently: drop the middle of a chain and the stage after the gap measures itself plus everything skipped before it. Deciding once per chain keeps every retained stage measuring exactly what it claims to, and makes sampleEvery mean "one iteration in N" for stages, which is what it already means for the loop those stages sit in.
+    CADENCE_ALWAYS_INLINE bool ShouldSampleChain(const LabelHandle& label, cudaStream_t stream) {
+        if (CADENCE_LIKELY(hotConfig.sampleEvery.load(std::memory_order_relaxed) <= 1)) return true;
+        ThreadState& state = TlsState();
+        StreamChain* chain = state.FindChain(stream);
+        const std::uint64_t generation = Registry::Instance().FlushGeneration();
+        if (chain->sampleGeneration != generation) {
+            chain->sampleGeneration = generation;
+            chain->sampled = ShouldSample(label);
+        }
+        return chain->sampled;
     }
 #endif
 

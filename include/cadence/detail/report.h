@@ -114,7 +114,7 @@ namespace cadence {
     }
 
     // Provenance. Anyone quoting a number from this report needs to know what produced it, and a throttled run looks exactly like a healthy one once the numbers are pasted somewhere else.
-    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords) {
+    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, bool anyEstimated) {
         out << "cadence report\n";
         out << "  device    " << info.deviceName;
         if (info.cudaAvailable) {
@@ -136,6 +136,14 @@ namespace cadence {
         if (stalledClockRecords > 0) {
             // Worth a warning rather than a silent drop: it says the host timings in this report are thinner than the counts suggest, and it says something true about the machine that the user probably did not know.
             out << "  WARNING   " << stalledClockRecords << " host span(s) dropped -- the monotonic clock did not advance across them, which happens on virtualized hosts; GPU figures are unaffected\n";
+        }
+        if (capturedScopes > 0) {
+            // Not a failure so much as a boundary: the scopes are inside a region cadence cannot instrument, and saying so is what stops the missing rows from reading as an absence of work.
+            out << "  WARNING   " << capturedScopes << " scope(s) skipped -- their stream was capturing into a CUDA graph, which cannot carry timing events; wrap the graph launch instead\n";
+        }
+        if (anyEstimated) {
+            // The counts stay honest, so a reader comparing n against the number of iterations needs to be told which columns thinned out and which did not.
+            out << "  sampled   the run outgrew its sample reservoir; n, mean, stddev, min, max and the deadline verdict are exact, p50/p95 and the distribution are estimates\n";
         }
     }
 
@@ -284,9 +292,11 @@ namespace cadence {
         out << "            [" << bar << "]  p95 " << FormatDuration(held->p95Ms, unicode) << " at " << p95Share << "\n";
     }
 
-    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords) {
+    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0) {
         const bool unicode = config.unicodeOutput;
-        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords);
+        bool anyEstimated = false;
+        for (const Stats& row : stats) anyEstimated = anyEstimated || row.estimated;
+        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, anyEstimated);
         WriteStatsTable(out, stats, unicode);
         WriteBudget(out, stats, unicode);
         WriteSummary(out, stats, unicode);

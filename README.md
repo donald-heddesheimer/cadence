@@ -108,6 +108,7 @@ added shows up on the Nsight timeline at no extra cost.
 - **Deadline reporting.** Give a stage a budget and the report says how many iterations held it, rather than leaving you to infer it from a percentile.
 - **CPU and GPU through the same API.** The host timers compile in translation units with no CUDA in them, so one set of macros covers the whole pipeline.
 - **Tunable overhead.** `CADENCE_STAGE` halves the number of events recorded, and `sampleEvery` measures one iteration in N. Both are opt-in, and [docs/overhead.md](docs/overhead.md) is explicit about what each one costs you in visibility.
+- **Bounded memory.** Observations per label are capped, so a loop left running for a week costs the same as one running for a minute. Count, mean, stddev, min, max and the deadline verdict stay exact past the cap; only the percentiles and the histogram become estimates, drawn from a uniform sample of the whole run rather than a recent window.
 - **Compiles to nothing.** `-DCADENCE_DISABLE` removes every macro without leaving a runtime branch behind, the same way `-DNVTX_DISABLE` works for NVTX.
 - **Provenance in the output.** Every report opens with the device, compute capability, clock ceilings, warmup count, sampling rate, and any dropped records, so a number can be traced back to the run that produced it.
 - **Header-only.** No third-party dependencies, MIT licensed.
@@ -153,6 +154,7 @@ cfg.unicodeOutput = false;   // ASCII table for terminals that mangle UTF-8
 cfg.sampleEvery = 1;         // measure one iteration in N
 cfg.budgetMs = 0.100;        // deadline for one stage; 0 disables the check
 cfg.budgetLabel = "";        // which stage; empty picks the loop span
+cfg.maxSamplesPerLabel = 32768;  // retained per row; 0 keeps every observation
 cfg.nvtxEnabled = true;
 cadence::Configure(cfg);
 
@@ -161,9 +163,14 @@ cadence::Reset();                                        // drop stats, restart 
 ```
 
 `CADENCE_WARMUP`, `CADENCE_OUTPUT`, `CADENCE_NVTX`, `CADENCE_SAMPLE`,
-`CADENCE_UNICODE`, `CADENCE_BUDGET_MS`, `CADENCE_BUDGET_LABEL` and
-`CADENCE_ENABLE` override the config from the environment, so a deployed binary
-can be re-pointed without a rebuild.
+`CADENCE_UNICODE`, `CADENCE_BUDGET_MS`, `CADENCE_BUDGET_LABEL`,
+`CADENCE_MAX_SAMPLES` and `CADENCE_ENABLE` override the config from the
+environment, so a deployed binary can be re-pointed without a rebuild.
+
+Set the budget before the loop starts. Misses are counted as observations
+arrive, which is what keeps the verdict exact on a run long enough to outgrow
+its sample reservoir, and it means a budget introduced part way through a run
+applies only to what came after it.
 
 ## How it measures
 
@@ -197,11 +204,17 @@ Best difference over 7 x 50,000 scopes on an RTX A4000:
 
 | | ns/scope | |
 |---|---:|---|
-| `CADENCE_KERNEL` | 3900 | two `cudaEventRecord` calls |
-| `CADENCE_STAGE` | 2490 | one event, chained |
-| `CADENCE_KERNEL`, 1 in 10 | 480 | sampled |
-| `CADENCE_SCOPE` | 321 | two `steady_clock` reads |
-| NVTX passthrough | ~20 | with no tool attached |
+| `CADENCE_KERNEL` | 3390 | two `cudaEventRecord` calls |
+| `CADENCE_STAGE` | 2410 | one event, chained |
+| `CADENCE_KERNEL`, 1 in 10 | 367 | sampled |
+| `CADENCE_SCOPE` | 330 | two `steady_clock` reads |
+| NVTX passthrough | ~10 | with no tool attached |
+
+Around 200 ns of each device scope is the guard that keeps cadence from
+recording into a stream that is capturing a CUDA graph, plus the device query
+that keeps events paired with the GPU that created them. Both are per scope and
+neither is optional, because the failures they prevent are silent ones.
+`CADENCE_SCOPE` touches no CUDA and pays neither.
 
 Nearly all of `CADENCE_KERNEL` is what the CUDA API charges for a timestamped
 event rather than anything cadence does. The same call with
@@ -227,10 +240,19 @@ at the top of this page, and `benchmarks/overhead.cu` produced the table above.
 
 ## What it does not do
 
-cadence measures elapsed time on a single GPU through the CUDA runtime API.
-Hardware counters are `ncu`'s job and system-wide timelines are `nsys`'s. There
-is no multi-GPU aggregation. Stream capture and CUDA graphs are not supported
-yet, because a captured `cudaEventRecord` does not fit the deferred-flush model.
+cadence measures elapsed time through the CUDA runtime API. Hardware counters
+are `ncu`'s job and system-wide timelines are `nsys`'s.
+
+Work captured into a CUDA graph is not measured. A `cudaEventRecord` issued into
+a capturing stream is baked into the graph rather than executed, which makes the
+event permanently unreadable and, if a flush lands before the capture closes,
+invalidates the capture itself. Scopes on a capturing stream therefore record
+nothing and the report says how many stood down. Wrap the graph launch instead
+of the region being captured.
+
+Events are pooled per device, so a process driving several GPUs measures each
+correctly, but the report still lists labels rather than devices: two GPUs
+running the same label share one row.
 
 ## License
 

@@ -24,17 +24,28 @@ namespace cadence {
     struct DeviceRecord {
         LabelId label;
         bool ownsStart; // false when start is prev stage's stop event
+        int device;     // Device the events were created on; they go back to that device's pool and nowhere else.
         cudaStream_t stream;
         cudaEvent_t start;
         cudaEvent_t stop;
         std::int64_t hostIssueNs; // cpu time spent in scope
     };
 
-    // The open end of a stage chain on one stream. 
+    // The open end of a stage chain on one stream.
     struct StreamChain {
         cudaStream_t stream;
         cudaEvent_t tail;
         std::uint64_t generation;
+        int device;                        // Device the tail was created on; a change breaks the chain rather than pairing events across devices.
+        // Sampling is decided once per chain rather than once per stage: a chain whose middle links are missing does not measure the stages that remain, it measures them plus the gaps where the skipped ones used to be.
+        std::uint64_t sampleGeneration;
+        bool sampled;
+    };
+
+    // A thread's private event supply for one device.
+    struct EventCache {
+        int device;
+        std::vector<cudaEvent_t> events;
     };
 #endif
 
@@ -47,7 +58,6 @@ namespace cadence {
             pendingHost.reserve(NUM_RECORDS_RESERVED);
 #if CADENCE_HAS_CUDA
             pendingDevice.reserve(NUM_RECORDS_RESERVED);
-            eventCache.reserve(NUM_EVENTS_PER_REFILL);
 #endif
         }
 
@@ -61,14 +71,24 @@ namespace cadence {
 
 #if CADENCE_HAS_CUDA
         std::vector<DeviceRecord> pendingDevice;
-        std::vector<cudaEvent_t> eventCache; // touched by owning thread
+        std::vector<EventCache> eventCaches; // touched by owning thread
         std::vector<StreamChain> chains;
+
+        // Both lists hold one entry per device or stream this thread has actually touched, which in practice is one or two, so a scan beats a hash lookup on the hot path.
+        std::vector<cudaEvent_t>& CacheFor(int device) {
+            for (EventCache& cache : eventCaches) {
+                if (cache.device == device) return cache.events;
+            }
+            eventCaches.push_back(EventCache{device, {}});
+            eventCaches.back().events.reserve(NUM_EVENTS_PER_REFILL);
+            return eventCaches.back().events;
+        }
 
         StreamChain* FindChain(cudaStream_t stream) {
             for (StreamChain& chain : chains) {
                 if (chain.stream == stream) return &chain;
             }
-            chains.push_back(StreamChain{stream, nullptr, 0});
+            chains.push_back(StreamChain{stream, nullptr, 0, -1, 0, true});
             return &chains.back();
         }
 #endif

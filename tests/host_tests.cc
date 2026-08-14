@@ -261,6 +261,87 @@ namespace {
     }
 
     // A budget is a count of misses, not an average overshoot: a loop that blows its deadline once in fifty has a healthy mean and a real problem.
+    // The reservoir bounds memory, and everything a deadline is judged on has to survive that. Count, extremes, mean, stddev and the miss count are maintained in constant space and stay exact no matter how far the run outruns the cap.
+    void TestBoundedRetentionKeepsExactAggregates() {
+        constexpr std::size_t CAP = 64;
+        constexpr int NUM_SAMPLES = 5000;
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.maxSamplesPerLabel = CAP;
+        config.budgetMs = 100.0;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        // 1.0 through 5000.0 milliseconds, so 4900 of them are over the 100 ms budget.
+        for (int i = 1; i <= NUM_SAMPLES; ++i) registry.RecordHost("long-run", static_cast<double>(i));
+        cadence::Flush();
+
+        bool found = false;
+        const cadence::Stats row = Find("long-run", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == static_cast<std::size_t>(NUM_SAMPLES));
+        CHECK(row.estimated);
+        CHECK_NEAR(row.minMs, 1.0, 1e-6);
+        CHECK_NEAR(row.maxMs, 5000.0, 1e-6);
+        CHECK_NEAR(row.meanMs, 2500.5, 1e-6);
+        CHECK(row.overBudget == 4900);
+        // The mean of 1..N is exact, so the standard deviation has a closed form to check it against.
+        CHECK_NEAR(row.stddevMs, 1443.5205, 1e-2);
+
+        // The estimated percentiles still have to land in the right neighbourhood, or the cap has traded a memory bug for a reporting one.
+        CHECK(row.p50Ms > 2000.0 && row.p50Ms < 3000.0);
+        CHECK(row.p95Ms > 4300.0 && row.p95Ms < 5000.0);
+
+        // The outlier bin is the reason the distribution column exists, and a reservoir that happened not to retain the slowest sample must not erase it.
+        CHECK(row.histogram[cadence::NUM_HISTOGRAM_BINS - 1] > 0);
+        CHECK(row.histogram[0] > 0);
+
+        std::ostringstream out;
+        cadence::WriteReport(out);
+        CHECK(out.str().find("outgrew its sample reservoir") != std::string::npos);
+
+        // A run that fits inside the cap reports nothing as estimated.
+        cadence::Reset();
+        for (int i = 1; i <= 10; ++i) registry.RecordHost("short-run", static_cast<double>(i));
+        cadence::Flush();
+        const cadence::Stats small = Find("short-run", cadence::ScopeKind::Host);
+        CHECK(!small.estimated);
+        CHECK(small.count == 10);
+    }
+
+    // The cap is what stops a loop left running for a week from growing until it is killed, so the bound itself is worth asserting rather than inferring.
+    void TestRetentionCapBoundsMemory() {
+        constexpr std::size_t CAP = 32;
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.maxSamplesPerLabel = CAP;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 0; i < 10000; ++i) registry.RecordHost("capped", 1.0 + (i % 7));
+        cadence::Flush();
+
+        const cadence::Stats row = Find("capped", cadence::ScopeKind::Host);
+        CHECK(row.count == 10000);
+
+        // Reservoir sampling is uniform over the whole run, so the retained samples should span the values the run actually produced rather than clustering on the most recent ones.
+        CHECK_NEAR(row.minMs, 1.0, 1e-9);
+        CHECK_NEAR(row.maxMs, 7.0, 1e-9);
+        CHECK_NEAR(row.meanMs, 4.0, 0.05);
+
+        // Zero means retain everything, which is what a short benchmark wants.
+        config.maxSamplesPerLabel = 0;
+        cadence::Configure(config);
+        cadence::Reset();
+        for (int i = 0; i < 500; ++i) registry.RecordHost("uncapped", 1.0);
+        cadence::Flush();
+        CHECK(!Find("uncapped", cadence::ScopeKind::Host).estimated);
+    }
+
     void TestBudgetCountsMisses() {
         cadence::Config config;
         config.warmupIterations = 0;
@@ -509,6 +590,8 @@ int main() {
         {"histogram rendering", TestHistogramRendering},
         {"histogram binning", TestHistogramBinning},
         {"stalled clock samples dropped", TestStalledClockSamplesAreDropped},
+        {"bounded retention keeps exact aggregates", TestBoundedRetentionKeepsExactAggregates},
+        {"retention cap bounds memory", TestRetentionCapBoundsMemory},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},
