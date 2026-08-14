@@ -241,10 +241,54 @@ namespace cadence {
         }
     }
 
+    // The deadline line. A mean cannot answer "did this loop hold its deadline", because a loop that misses one iteration in fifty has a perfectly healthy mean and a real problem. This answers it as a count, and draws the bar against p95 rather than the mean so the figure shown is one you could plan against.
+    inline void WriteBudget(std::ostream& out, const std::vector<Stats>& stats, bool unicode) {
+        const Stats* held = nullptr;
+        for (const Stats& row : stats) {
+            if (row.budgetMs > 0.0 && row.count > 0) held = &row;
+        }
+        if (held == nullptr) return;
+
+        const std::size_t met = held->count - held->overBudget;
+        char metShare[32];
+        std::snprintf(metShare, sizeof(metShare), "%.1f%%", 100.0 * static_cast<double>(met) / static_cast<double>(held->count));
+        char worstShare[32];
+        std::snprintf(worstShare, sizeof(worstShare), "%.0f%%", 100.0 * held->maxMs / held->budgetMs);
+
+        std::string key = "deadline";
+        PadTo(key, 8);
+        out << "\n  " << key << "  " << FormatDuration(held->budgetMs, unicode) << " on " << held->label << " ("
+            << ScopeKindName(held->kind) << ")\n";
+
+        std::string verdict = held->overBudget == 0 ? "met" : "MISSED";
+        PadTo(verdict, 8);
+        out << "  " << verdict << "  " << met << "/" << held->count << " iterations inside budget (" << metShare
+            << "); worst " << FormatDuration(held->maxMs, unicode) << " at " << worstShare << " of budget\n";
+
+        // Filled against p95 and clamped at full: past the deadline the only thing worth reading is that it was passed, and a bar that runs off the line says that more plainly than a longer bar would.
+        constexpr std::size_t NUM_BAR_CELLS = 40;
+        const double share = held->p95Ms / held->budgetMs;
+        std::size_t filled = static_cast<std::size_t>(share * static_cast<double>(NUM_BAR_CELLS));
+        if (filled > NUM_BAR_CELLS) filled = NUM_BAR_CELLS;
+
+        std::string bar;
+        for (std::size_t cell = 0; cell < NUM_BAR_CELLS; ++cell) {
+            if (cell < filled) {
+                bar += unicode ? "\xe2\x96\x88" : "#";  // U+2588 FULL BLOCK
+            } else {
+                bar += unicode ? "\xe2\x96\x91" : ".";  // U+2591 LIGHT SHADE
+            }
+        }
+        char p95Share[32];
+        std::snprintf(p95Share, sizeof(p95Share), "%.0f%%", 100.0 * share);
+        out << "            [" << bar << "]  p95 " << FormatDuration(held->p95Ms, unicode) << " at " << p95Share << "\n";
+    }
+
     inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords) {
         const bool unicode = config.unicodeOutput;
         WriteReportHeader(out, config, info, failedRecords, stalledClockRecords);
         WriteStatsTable(out, stats, unicode);
+        WriteBudget(out, stats, unicode);
         WriteSummary(out, stats, unicode);
         out << "\n  elapsed time only; for occupancy or bandwidth use `ncu`.\n";
         out.flush();

@@ -32,6 +32,12 @@ namespace cadence {
 
         // Measure one observation in every N per label; 1 measures all of them.
         unsigned sampleEvery = 1;
+
+        // The deadline one stage is held to, in milliseconds. Zero disables the check. A loop that must close at 100 Hz sets 10.0 and the report then says how often it did not, which is the question a mean cannot answer.
+        double budgetMs = 0.0;
+
+        // Which label the budget applies to. Empty picks the loop span automatically: the one label that recorded host time but never launched a kernel, which is the CADENCE_SCOPE wrapped around the iteration. Naming a label explicitly holds that label instead, preferring its GPU row when it has one.
+        std::string budgetLabel;
     };
 
     namespace detail {
@@ -63,7 +69,7 @@ namespace cadence {
         return fallback;
     }
 
-    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE.
+    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL.
     inline void ApplyEnvironmentOverrides(Config& config) {
         if (const char* warmup = EnvOrNull("CADENCE_WARMUP")) {
             config.warmupIterations = static_cast<unsigned>(std::strtoul(warmup, nullptr, 10));
@@ -78,6 +84,12 @@ namespace cadence {
         config.nvtxEnabled = ParseBool(EnvOrNull("CADENCE_NVTX"), config.nvtxEnabled);
         config.enabled = ParseBool(EnvOrNull("CADENCE_ENABLE"), config.enabled);
         config.unicodeOutput = ParseBool(EnvOrNull("CADENCE_UNICODE"), config.unicodeOutput);
+        if (const char* budget = EnvOrNull("CADENCE_BUDGET_MS")) {
+            config.budgetMs = std::strtod(budget, nullptr);
+        }
+        if (const char* label = EnvOrNull("CADENCE_BUDGET_LABEL")) {
+            config.budgetLabel = label;
+        }
     }
     }  // namespace detail
 }  // namespace cadence

@@ -37,6 +37,10 @@ namespace cadence {
         double jitterMs = 0.0;
         // Sample counts in NUM_HISTOGRAM_BINS equal-width bins spanning min to max. A summary row cannot show that a label is bimodal; this can, and it is the one thing in the report that makes a stall visible rather than merely averaged in. Fixed-width so Stats stays cheap to copy.
         std::array<std::uint32_t, NUM_HISTOGRAM_BINS> histogram{};
+
+        // The deadline this row is held to, and how often it was missed. Zero means no budget applies here, which is the case for every row but the one the budget names.
+        double budgetMs = 0.0;
+        std::size_t overBudget = 0;
     };
 
     namespace detail {
@@ -49,12 +53,13 @@ namespace cadence {
     }
 
     // Takes the sample vector by value: it is sorted in place to find percentiles.
-    inline Stats ComputeStats(const std::string& label, ScopeKind kind, std::vector<double> samples, std::size_t discarded) {
+    inline Stats ComputeStats(const std::string& label, ScopeKind kind, std::vector<double> samples, std::size_t discarded, double budgetMs = 0.0) {
         Stats stats;
         stats.label = label;
         stats.kind = kind;
         stats.discarded = discarded;
         stats.count = samples.size();
+        stats.budgetMs = budgetMs;
         if (samples.empty()) return stats;
 
         std::sort(samples.begin(), samples.end());
@@ -86,6 +91,11 @@ namespace cadence {
                 if (bin >= NUM_HISTOGRAM_BINS) bin = NUM_HISTOGRAM_BINS - 1;
             }
             ++stats.histogram[bin];
+        }
+        // Counted on the sorted range: everything past the first sample above the deadline missed it. A budget is about how often, not by how much on average, so this is a count rather than a mean.
+        if (budgetMs > 0.0) {
+            const auto firstOver = std::upper_bound(samples.begin(), samples.end(), budgetMs);
+            stats.overBudget = static_cast<std::size_t>(std::distance(firstOver, samples.end()));
         }
         return stats;
     }

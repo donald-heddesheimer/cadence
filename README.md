@@ -58,6 +58,33 @@ healthy, but one iteration took 367 µs. The histogram shows it as a lone mark
 far to the right of the mass. That is the iteration that missed the deadline,
 and no column of averages would have told you it existed.
 
+## Deadlines
+
+If your loop has to close at a fixed rate, give cadence the budget and it reports
+how often you held it:
+
+```cpp
+cadence::Config cfg;
+cfg.budgetMs = 0.100;   // this loop must close at 10 kHz
+cadence::Configure(cfg);
+```
+
+```
+  deadline  100µs on iteration (host)
+  met       190/190 iterations inside budget (100.0%); worst 70.5µs at 71% of budget
+            [███████████████████████████░░░░░░░░░░░░░]  p95 69.9µs at 70%
+```
+
+The verdict is a count of misses rather than an average overshoot, because a loop
+that blows its deadline once in fifty has a healthy mean and a real problem. The
+bar is drawn against p95, so the figure it shows is one you could plan against.
+
+With no label named, the budget lands on the loop span: the one label that
+recorded host time but never launched a kernel, which is the `CADENCE_SCOPE`
+around your iteration. Set `cfg.budgetLabel` to hold a specific stage instead;
+a named label with GPU work is held to its GPU time. If the choice is ambiguous
+(two host-only labels, say), no row carries the budget rather than the wrong one.
+
 ## Where it fits
 
 | | Answers | How you run it | Usable in a live loop? |
@@ -78,6 +105,7 @@ added shows up on the Nsight timeline at no extra cost.
 - **Two lines to instrument a stage.** A scope guard, and a flush at the loop boundary.
 - **No synchronization on the hot path.** Event pairs are buffered and resolved at `CADENCE_FLUSH()`, which you put at a boundary where you were going to synchronize anyway. Instrumentation never serializes the pipeline it is measuring.
 - **Distributions rather than averages.** mean, min, p50, p95, max, stddev, and jitter (max minus min) for every label. A loop with a deadline is decided by its tail.
+- **Deadline reporting.** Give a stage a budget and the report says how many iterations held it, rather than leaving you to infer it from a percentile.
 - **CPU and GPU through the same API.** The host timers compile in translation units with no CUDA in them, so one set of macros covers the whole pipeline.
 - **Tunable overhead.** `CADENCE_STAGE` halves the number of events recorded, and `sampleEvery` measures one iteration in N. Both are opt-in, and [docs/overhead.md](docs/overhead.md) is explicit about what each one costs you in visibility.
 - **Compiles to nothing.** `-DCADENCE_DISABLE` removes every macro without leaving a runtime branch behind, the same way `-DNVTX_DISABLE` works for NVTX.
@@ -123,6 +151,8 @@ cfg.outputPath = "run.txt";  // also write the report here; empty means print on
 cfg.reportStream = &std::cerr;  // where it prints; nullptr suppresses printing
 cfg.unicodeOutput = false;   // ASCII table for terminals that mangle UTF-8
 cfg.sampleEvery = 1;         // measure one iteration in N
+cfg.budgetMs = 0.100;        // deadline for one stage; 0 disables the check
+cfg.budgetLabel = "";        // which stage; empty picks the loop span
 cfg.nvtxEnabled = true;
 cadence::Configure(cfg);
 
@@ -131,7 +161,8 @@ cadence::Reset();                                        // drop stats, restart 
 ```
 
 `CADENCE_WARMUP`, `CADENCE_OUTPUT`, `CADENCE_NVTX`, `CADENCE_SAMPLE`,
-`CADENCE_UNICODE` and `CADENCE_ENABLE` override the config from the environment, so a deployed binary
+`CADENCE_UNICODE`, `CADENCE_BUDGET_MS`, `CADENCE_BUDGET_LABEL` and
+`CADENCE_ENABLE` override the config from the environment, so a deployed binary
 can be re-pointed without a rebuild.
 
 ## How it measures

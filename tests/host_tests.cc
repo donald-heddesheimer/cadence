@@ -260,6 +260,74 @@ namespace {
         CHECK(out.str().find("monotonic clock did not advance") != std::string::npos);
     }
 
+    // A budget is a count of misses, not an average overshoot: a loop that blows its deadline once in fifty has a healthy mean and a real problem.
+    void TestBudgetCountsMisses() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.budgetMs = 10.0;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 0; i < 8; ++i) registry.RecordHost("loop", 5.0);
+        registry.RecordHost("loop", 12.0);  // Missed.
+        registry.RecordHost("loop", 30.0);  // Missed.
+        cadence::Flush();
+
+        bool found = false;
+        const cadence::Stats row = Find("loop", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 10);
+        CHECK_NEAR(row.budgetMs, 10.0, 1e-9);
+        CHECK(row.overBudget == 2);
+
+        std::ostringstream out;
+        cadence::WriteReport(out);
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("8/10 iterations inside budget") != std::string::npos);
+
+        // A sample exactly on the deadline is inside it, not over it.
+        cadence::Reset();
+        for (int i = 0; i < 4; ++i) registry.RecordHost("loop", 10.0);
+        cadence::Flush();
+        const cadence::Stats exact = Find("loop", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(exact.overBudget == 0);
+    }
+
+    // With no label named the budget has to pick one row on its own, and picking the wrong one is worse than picking none.
+    void TestBudgetTargetSelection() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.budgetMs = 10.0;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        registry.RecordHost("alpha", 1.0);
+        registry.RecordHost("beta", 2.0);
+        cadence::Flush();
+
+        // Two host-only labels: ambiguous, so no row carries the budget.
+        bool found = false;
+        CHECK(Find("alpha", cadence::ScopeKind::Host, &found).budgetMs == 0.0);
+        CHECK(Find("beta", cadence::ScopeKind::Host, &found).budgetMs == 0.0);
+
+        // Naming one resolves it.
+        config.budgetLabel = "beta";
+        cadence::Configure(config);
+        CHECK(Find("alpha", cadence::ScopeKind::Host, &found).budgetMs == 0.0);
+        CHECK_NEAR(Find("beta", cadence::ScopeKind::Host, &found).budgetMs, 10.0, 1e-9);
+
+        // A label that does not exist holds nothing, rather than falling back to a guess.
+        config.budgetLabel = "nonexistent";
+        cadence::Configure(config);
+        CHECK(Find("beta", cadence::ScopeKind::Host, &found).budgetMs == 0.0);
+    }
+
     // Samples land in the bin their magnitude earns, which is what makes the column readable at a glance.
     void TestHistogramBinning() {
         cadence::Config config;
@@ -441,6 +509,8 @@ int main() {
         {"histogram rendering", TestHistogramRendering},
         {"histogram binning", TestHistogramBinning},
         {"stalled clock samples dropped", TestStalledClockSamplesAreDropped},
+        {"budget counts misses", TestBudgetCountsMisses},
+        {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},
         {"environment overrides", TestEnvironmentOverridesWinOverStruct},
         {"thread-safe recording", TestThreadSafeRecording},

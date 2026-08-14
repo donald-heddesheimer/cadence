@@ -204,7 +204,12 @@ namespace cadence {
         // Flush() first if you want the current loop's records included.
         std::vector<Stats> Snapshot() const {
             const std::vector<std::string> names = LabelTable::Instance().Names();
+            // Read before samplesMutex_ so this function never holds two locks at once.
+            const Config config = GetConfig();
+
             std::lock_guard<std::mutex> lock(samplesMutex_);
+            const BudgetTarget target = ResolveBudgetTarget(config, names);
+
             std::vector<Stats> results;
             results.reserve(samples_.size());
             for (std::size_t id = 0; id < samples_.size(); ++id) {
@@ -212,12 +217,13 @@ namespace cadence {
                 if (samples.deviceMs.empty() && samples.hostMs.empty()) continue;
                 const std::string& name = id < names.size() ? names[id] : std::string();
                 if (samples.hasDevice) {
-                    results.push_back(
-                        ComputeStats(name, ScopeKind::Device, samples.deviceMs, samples.discarded));
+                    const double budget = target.Matches(id, ScopeKind::Device) ? config.budgetMs : 0.0;
+                    results.push_back(ComputeStats(name, ScopeKind::Device, samples.deviceMs, samples.discarded, budget));
                 }
                 if (!samples.hostMs.empty()) {
                     // For a device scope this row is the CPU-issue side of the same label: compare it against the device row to see launch-bound vs compute-bound.
-                    results.push_back(ComputeStats(name, ScopeKind::Host, samples.hostMs, samples.discarded));
+                    const double budget = target.Matches(id, ScopeKind::Host) ? config.budgetMs : 0.0;
+                    results.push_back(ComputeStats(name, ScopeKind::Host, samples.hostMs, samples.discarded, budget));
                 }
             }
             return results;
@@ -280,6 +286,47 @@ namespace cadence {
         unsigned WarmupIterations() const {
             std::lock_guard<std::mutex> lock(configMutex_);
             return config_.warmupIterations;
+        }
+
+        // Exactly one row in the report carries the budget, so the target is resolved once per snapshot rather than tested per row.
+        struct BudgetTarget {
+            bool active = false;
+            std::size_t id = 0;
+            ScopeKind kind = ScopeKind::Host;
+
+            bool Matches(std::size_t candidate, ScopeKind candidateKind) const {
+                return active && candidate == id && candidateKind == kind;
+            }
+        };
+
+        // Called with samplesMutex_ held. An explicit label wins; a named label with GPU work is held to its GPU time, since that is what someone naming a kernel means. With no label named, the budget falls to the loop span: the sole label that recorded host time and never launched anything, which is the CADENCE_SCOPE around the iteration. Ambiguity resolves to no budget rather than to a guess, because a deadline reported against the wrong row is worse than no deadline at all.
+        BudgetTarget ResolveBudgetTarget(const Config& config, const std::vector<std::string>& names) const {
+            BudgetTarget target;
+            if (config.budgetMs <= 0.0) return target;
+
+            if (!config.budgetLabel.empty()) {
+                for (std::size_t id = 0; id < samples_.size(); ++id) {
+                    if (id >= names.size() || names[id] != config.budgetLabel) continue;
+                    const LabelSamples& samples = samples_[id];
+                    if (samples.hasDevice) {
+                        target = BudgetTarget{true, id, ScopeKind::Device};
+                    } else if (!samples.hostMs.empty()) {
+                        target = BudgetTarget{true, id, ScopeKind::Host};
+                    }
+                    return target;
+                }
+                return target;
+            }
+
+            std::size_t hostOnlyCount = 0;
+            for (std::size_t id = 0; id < samples_.size(); ++id) {
+                const LabelSamples& samples = samples_[id];
+                if (samples.hasDevice || samples.hostMs.empty()) continue;
+                ++hostOnlyCount;
+                target = BudgetTarget{true, id, ScopeKind::Host};
+            }
+            if (hostOnlyCount != 1) target.active = false;
+            return target;
         }
 
         // Called with samplesMutex_ held.

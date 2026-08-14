@@ -41,6 +41,8 @@ namespace {
 int main() {
     cadence::Config config;
     config.warmupIterations = 10;  // Discard context creation and autotuning.
+    // A loop that has to close at 12.5 kHz. With no label named, the budget lands on the one scope that never launched a kernel, which is the "iteration" span below.
+    config.budgetMs = 0.080;
     cadence::Configure(config);
 
     float* deviceX = nullptr;
