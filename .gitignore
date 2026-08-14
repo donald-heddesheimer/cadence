@@ -6,8 +6,8 @@ build/
 build-*/
 cmake-build-*/
 
-# Reports written by the examples.
-cadence.csv
+# Reports written when outputPath is set.
+cadence-report.txt
 *.nsys-rep
 *.qdrep
 

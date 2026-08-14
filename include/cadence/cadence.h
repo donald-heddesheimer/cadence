@@ -8,7 +8,7 @@
 //     { CADENCE_KERNEL("gemm", stream); Gemm<<<grid, block, 0, stream>>>(...); }
 //     CADENCE_FLUSH();            // once per loop iteration, not per kernel
 //   }
-//   CADENCE_REPORT();             // writes cadence.csv
+//   CADENCE_REPORT();             // prints the report
 
 #pragma once  // ensure the header is only pulled in one time
 
@@ -46,24 +46,28 @@ namespace cadence {
     // Records dropped because event creation or an elapsed-time query failed.
     inline std::size_t FailedRecordCount() { return detail::Registry::Instance().FailedRecordCount(); }
 
-    // Write the report to an already-open stream. Does not flush first.
-    inline void WriteCsv(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
+    // Host spans dropped because the monotonic clock did not advance across them. Nonzero says the machine's clock is unreliable under load, not that the measured code was fast.
+    inline std::size_t StalledClockCount() { return detail::Registry::Instance().StalledClockCount(); }
+
+    // Render the report to an already-open stream. Does not flush first.
+    inline void WriteReport(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
 
     // Returns false if the file could not be opened.
-    inline bool WriteCsv(const std::string& path) {
+    inline bool WriteReport(const std::string& path) {
         std::ofstream out(path);
         if (!out) return false;
-        WriteCsv(out);
+        WriteReport(out);
         return out.good();
     }
 
-    // Flush, then write to the configured output path. The one call most applications need at shutdown; it also cancels the exit-time fallback write.
+    // Flush, then print the report to the configured stream and, if outputPath is set, write the same text there. The one call most applications need at shutdown; it also cancels the exit-time fallback.
     inline bool Report() {
         Flush();
-        const std::string path = GetConfig().outputPath;
+        const Config config = GetConfig();
         detail::Registry::Instance().MarkReported();
-        if (path.empty()) return true;
-        return WriteCsv(path);
+        if (config.reportStream) WriteReport(*config.reportStream);
+        if (config.outputPath.empty()) return true;
+        return WriteReport(config.outputPath);
     }
 
 }  // namespace cadence

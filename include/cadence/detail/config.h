@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <iostream>
+#include <ostream>
 #include <string>
 
 namespace cadence {
@@ -10,8 +12,14 @@ namespace cadence {
         // Iterations discarded per label before statistics accumulate. The first launches pay for context creation, JIT, and library autotuning (cuBLAS/cuDNN), so counting them poisons the mean and the minimum.
         unsigned warmupIterations = 3;
 
-        // Where Report() writes. Empty disables file output.
-        std::string outputPath = "cadence.csv";
+        // Report() always renders to `reportStream` below. Setting this additionally writes the same text to a file, for a run whose console you will not be watching. Empty by default: the report is meant to be read where it is printed, not hunted for on disk.
+        std::string outputPath;
+
+        // Where the report is printed. stdout by default, the way a benchmark tool prints its results; point it at std::cerr to keep it out of a pipeline, or at nullptr to suppress printing and rely on outputPath alone.
+        std::ostream* reportStream = &std::cout;
+
+        // Box-drawing characters and block glyphs in the report. Turn it off for a terminal or a log collector that mangles UTF-8; the table then renders in pure ASCII.
+        bool unicodeOutput = true;
 
         // Mirror every scope as an NVTX range so the same instrumentation lights up Nsight Systems when a tool is attached. Costs ~nothing when it is not.
         bool nvtxEnabled = true;
@@ -55,7 +63,7 @@ namespace cadence {
         return fallback;
     }
 
-    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE.
+    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE.
     inline void ApplyEnvironmentOverrides(Config& config) {
         if (const char* warmup = EnvOrNull("CADENCE_WARMUP")) {
             config.warmupIterations = static_cast<unsigned>(std::strtoul(warmup, nullptr, 10));
@@ -69,6 +77,7 @@ namespace cadence {
         }
         config.nvtxEnabled = ParseBool(EnvOrNull("CADENCE_NVTX"), config.nvtxEnabled);
         config.enabled = ParseBool(EnvOrNull("CADENCE_ENABLE"), config.enabled);
+        config.unicodeOutput = ParseBool(EnvOrNull("CADENCE_UNICODE"), config.unicodeOutput);
     }
     }  // namespace detail
 }  // namespace cadence

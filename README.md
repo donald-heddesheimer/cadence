@@ -7,7 +7,7 @@ Time the stages of a CUDA loop from inside your own process. Header-only, C++17.
 [![standard](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](include/cadence)
 
-You wrap the stages you care about, run the application normally, and get a
+You wrap the stages you care about, run the application normally, and it prints a
 latency distribution for each stage when it exits. There is no profiler to
 launch, no process to attach, and no capture file to open afterwards. Since the
 instrumentation compiles into your binary, you can leave it in and look at every
@@ -25,24 +25,38 @@ while (running) {
   cudaStreamSynchronize(stream);
   CADENCE_FLUSH();          // once per iteration, never between scopes
 }
-CADENCE_REPORT();           // writes cadence.csv
+CADENCE_REPORT();           // prints the report below
 ```
 
 ```
-iteration    host    n=190   mean=  0.0686 ms  p95=  0.0696 ms  jitter=  0.0035 ms
-saxpy        device  n=190   mean=  0.0372 ms  p95=  0.0379 ms  jitter=  0.0028 ms
-saxpy        host    n=190   mean=  0.0050 ms  p95=  0.0053 ms  jitter=  0.0014 ms
-scale        device  n=190   mean=  0.0243 ms  p95=  0.0248 ms  jitter=  0.0020 ms
-scale        host    n=190   mean=  0.0052 ms  p95=  0.0055 ms  jitter=  0.0205 ms
+cadence report
+  device    NVIDIA RTX A4000 (sm_86), sm clock <= 1560 MHz, mem clock <= 7001 MHz
+  clocks    not locked by cadence; run `nvidia-smi -lgc 1560` before comparing runs
+  warmup    10 iteration(s) discarded per label
+
+  label      scope     n    mean     p50     p95     max  jitter  distribution
+  ────────────────────────────────────────────────────────────────────────────
+  iteration  host    190  70.3µs  68.6µs  70.0µs   367µs   302µs  █          ▂
+  saxpy      device  190  37.3µs  36.9µs  37.9µs  41.0µs  5.12µs  ▂▂█▂▆▂▂▂   ▂
+  saxpy      host    190  5.09µs  5.01µs  5.49µs  10.2µs  7.94µs  ▂  ▂█▂ ▂   ▂
+  scale      device  190  24.2µs  24.6µs  24.6µs  25.6µs  3.07µs  ▂   ▇   █  ▂
+  scale      host    190  5.14µs  5.06µs  5.50µs  8.04µs  3.31µs  ▇█▅▂▂      ▂
+
+  device    61.5µs across 2 label(s)
+  iteration  70.3µs, of which 87.5% is GPU work; 8.80µs is launch and synchronization
+
+  elapsed time only; for occupancy or bandwidth use `ncu`.
 ```
 
 Every label reports twice. `device` is GPU execution time measured with CUDA
-events. `host` is the CPU time spent issuing the work.
+events. `host` is the CPU time spent issuing the work. When the two rows for a
+label converge, that stage is launch-bound rather than compute-bound.
 
-Reading the run above: the loop closes in 68.6 µs and 61.5 µs of that is GPU
-execution, so about 7 µs goes to launch and synchronization. Tuning the kernels
-further would not buy much. When the host and device rows for a single label
-converge, that stage is launch-bound rather than compute-bound.
+The `distribution` column is why the report is worth reading rather than
+grepping. `iteration` has a mean of 70.3 µs and a p50 of 68.6 µs, which looks
+healthy, but one iteration took 367 µs. The histogram shows it as a lone mark
+far to the right of the mass. That is the iteration that missed the deadline,
+and no column of averages would have told you it existed.
 
 ## Where it fits
 
@@ -67,7 +81,7 @@ added shows up on the Nsight timeline at no extra cost.
 - **CPU and GPU through the same API.** The host timers compile in translation units with no CUDA in them, so one set of macros covers the whole pipeline.
 - **Tunable overhead.** `CADENCE_STAGE` halves the number of events recorded, and `sampleEvery` measures one iteration in N. Both are opt-in, and [docs/overhead.md](docs/overhead.md) is explicit about what each one costs you in visibility.
 - **Compiles to nothing.** `-DCADENCE_DISABLE` removes every macro without leaving a runtime branch behind, the same way `-DNVTX_DISABLE` works for NVTX.
-- **Provenance in the output.** The CSV header records the device, compute capability, clock ceilings, warmup count, sampling rate, and any dropped records, so a number can be traced back to the run that produced it.
+- **Provenance in the output.** Every report opens with the device, compute capability, clock ceilings, warmup count, sampling rate, and any dropped records, so a number can be traced back to the run that produced it.
 - **Header-only.** No third-party dependencies, MIT licensed.
 
 ## Install
@@ -98,14 +112,16 @@ Or copy `include/cadence` onto your include path and skip CMake entirely.
 | `CADENCE_STAGE("label", stream)` | GPU span, one event, chained to the previous stage | 2.5 µs |
 | `CADENCE_SCOPE("label")` | CPU span, `steady_clock` | 0.32 µs |
 | `CADENCE_FLUSH()` | resolves pending records; synchronizes | once per loop |
-| `CADENCE_REPORT()` | flush, then write the CSV | once per run |
+| `CADENCE_REPORT()` | flush, then print the report | once per run |
 
 The `stream` argument is optional and defaults to the default stream.
 
 ```cpp
 cadence::Config cfg;
 cfg.warmupIterations = 10;   // discard context creation, JIT, cuBLAS autotuning
-cfg.outputPath = "run.csv";  // empty disables file output
+cfg.outputPath = "run.txt";  // also write the report here; empty means print only
+cfg.reportStream = &std::cerr;  // where it prints; nullptr suppresses printing
+cfg.unicodeOutput = false;   // ASCII table for terminals that mangle UTF-8
 cfg.sampleEvery = 1;         // measure one iteration in N
 cfg.nvtxEnabled = true;
 cadence::Configure(cfg);
@@ -114,8 +130,8 @@ std::vector<cadence::Stats> rows = cadence::Snapshot();  // assert on these in t
 cadence::Reset();                                        // drop stats, restart warmup
 ```
 
-`CADENCE_WARMUP`, `CADENCE_OUTPUT`, `CADENCE_NVTX`, `CADENCE_SAMPLE` and
-`CADENCE_ENABLE` override the config from the environment, so a deployed binary
+`CADENCE_WARMUP`, `CADENCE_OUTPUT`, `CADENCE_NVTX`, `CADENCE_SAMPLE`,
+`CADENCE_UNICODE` and `CADENCE_ENABLE` override the config from the environment, so a deployed binary
 can be re-pointed without a rebuild.
 
 ## How it measures
@@ -132,9 +148,17 @@ The first N iterations of each label are discarded, 3 by default. Those
 iterations pay for context creation, JIT, and cuBLAS or cuDNN autotuning, and
 counting them distorts both the mean and the minimum.
 
+A host span that measures exactly zero nanoseconds is discarded rather than
+recorded. Two clock reads with real work between them cannot return the same
+value, so a zero means the monotonic clock stalled, which happens on virtualized
+hosts after a blocking call. One such sample would pin a label's minimum at zero
+and stretch its jitter and histogram across a range nothing ever occupied. The
+report says how many were dropped; GPU figures come from CUDA events and are
+unaffected.
+
 cadence does not lock clocks. Boost behaviour drifts from run to run, so pin
-with `nvidia-smi -lgc <mhz>` before comparing two runs. The CSV header records
-the clock ceilings it saw either way.
+with `nvidia-smi -lgc <mhz>` before comparing two runs. The report records the
+clock ceilings it saw either way.
 
 ## Overhead
 

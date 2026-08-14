@@ -47,7 +47,7 @@ int main() {
     cudaStreamCreate(&stream);
 
     cadence::Config config;
-    config.outputPath.clear();  // This benchmark reports to stdout, not to a file.
+    config.reportStream = nullptr;  // This benchmark prints its own numbers.
     config.warmupIterations = 0;
     config.nvtxEnabled = false;
     config.writeOnExit = false;

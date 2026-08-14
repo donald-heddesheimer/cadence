@@ -53,7 +53,7 @@ namespace {
 
     void ResetLibrary(unsigned warmup, unsigned sampleEvery) {
         cadence::Config config;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         config.warmupIterations = warmup;
         config.nvtxEnabled = false;
         config.writeOnExit = false;

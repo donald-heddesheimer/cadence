@@ -5,7 +5,7 @@
 //   cmake -B build && cmake --build build
 //   ./build/examples/cadence_example_loop
 //
-// Then read cadence.csv.
+// The report prints when the loop finishes.
 
 #include <cadence/cadence.h>
 
@@ -41,7 +41,6 @@ namespace {
 int main() {
     cadence::Config config;
     config.warmupIterations = 10;  // Discard context creation and autotuning.
-    config.outputPath = "cadence.csv";
     cadence::Configure(config);
 
     float* deviceX = nullptr;
@@ -82,11 +81,6 @@ int main() {
     if (!CudaOk(cudaGetLastError(), "kernel launch")) return 1;
 
     CADENCE_REPORT();
-
-    for (const cadence::Stats& row : cadence::Snapshot()) {
-        std::printf("%-12s %-7s n=%-5zu mean=%8.4f ms  p95=%8.4f ms  jitter=%8.4f ms\n", row.label.c_str(), cadence::ScopeKindName(row.kind), row.count, row.meanMs, row.p95Ms, row.jitterMs);
-    }
-    std::printf("\nwrote %s\n", config.outputPath.c_str());
 
     cudaStreamDestroy(stream);
     cudaFree(deviceX);

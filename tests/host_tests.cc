@@ -2,7 +2,10 @@
 
 #include <cadence/cadence.h>
 
+#include <array>
+#include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -30,6 +33,13 @@ namespace {
 
 #define CHECK(cond) Check((cond), #cond, __LINE__)
 #define CHECK_NEAR(actual, expected, tol) CheckNear((actual), (expected), (tol), #actual, __LINE__)
+
+    // A scope with an empty body can measure zero nanoseconds, and a zero-length span is discarded as a stalled clock. Tests that count samples spin briefly so the count depends on the thing under test rather than on clock resolution.
+    void BurnBriefly() {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(2);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
 
     // Finds one row of a Snapshot() by label and scope. Takes the snapshot itself rather than a reference into one. Returning a pointer into a vector the caller passed as a temporary is a use-after-free waiting for the first person who writes Find(cadence::Snapshot(), ...).
     cadence::Stats Find(const std::string& label, cadence::ScopeKind kind, bool* found = nullptr) {
@@ -79,7 +89,7 @@ namespace {
     void TestWarmupDiscard() {
         cadence::Config config;
         config.warmupIterations = 3;
-        config.outputPath.clear();  // Keep the test from littering the build dir.
+        config.reportStream = nullptr;  // Keep the test from printing over the test log.
         cadence::Configure(config);
         cadence::Reset();
 
@@ -103,7 +113,7 @@ namespace {
     void TestWarmupPersistsAcrossFlushes() {
         cadence::Config config;
         config.warmupIterations = 2;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
@@ -126,7 +136,7 @@ namespace {
     void TestScopedHostMeasuresRealTime() {
         cadence::Config config;
         config.warmupIterations = 0;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
@@ -150,7 +160,7 @@ namespace {
     void TestRuntimeDisableStopsCollection() {
         cadence::Config config;
         config.enabled = false;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
@@ -162,35 +172,121 @@ namespace {
         cadence::Configure(config);
     }
 
-    void TestCsvOutput() {
+    void TestReportOutput() {
         cadence::Config config;
         config.warmupIterations = 1;
-        config.outputPath.clear();
+        config.reportStream = nullptr;  // Keep the test from printing over the test log.
         cadence::Configure(config);
         cadence::Reset();
 
         cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
-        registry.RecordHost("csvlabel", 9.0);  // Discarded as warmup.
-        registry.RecordHost("csvlabel", 1.5);
-        registry.RecordHost("csvlabel", 2.5);
+        registry.RecordHost("reportlabel", 9.0);  // Discarded as warmup.
+        registry.RecordHost("reportlabel", 1.5);
+        registry.RecordHost("reportlabel", 2.5);
         cadence::Flush();
 
         std::ostringstream out;
-        cadence::WriteCsv(out);
+        cadence::WriteReport(out);
         const std::string text = out.str();
 
-        // Provenance header: warmup and clock state must be visible in the artifact, so nobody quotes a throttled run as gospel.
-        CHECK(text.find("# cadence report") != std::string::npos);
-        CHECK(text.find("warmup_iterations_discarded_per_label: 1") != std::string::npos);
-        CHECK(text.find("clock_state:") != std::string::npos);
-        CHECK(text.find("label,scope,count,warmup_discarded,mean_ms") != std::string::npos);
-        CHECK(text.find("csvlabel,host,2,1,2.000000") != std::string::npos);
+        // Provenance: warmup must be visible in the artifact, so nobody quotes a throttled run as gospel.
+        CHECK(text.find("cadence report") != std::string::npos);
+        CHECK(text.find("1 iteration(s) discarded per label") != std::string::npos);
+        // The row itself: two kept samples of 1.5 and 2.5 ms, so a 2.00 ms mean rendered in milliseconds.
+        CHECK(text.find("reportlabel") != std::string::npos);
+        CHECK(text.find("2.00ms") != std::string::npos);
+        CHECK(text.find("distribution") != std::string::npos);
+    }
+
+    // Units are chosen per number, not per report: a host scope measured in microseconds and a kernel measured in milliseconds appear in one table and both have to be readable.
+    void TestDurationFormatting() {
+        CHECK(cadence::detail::FormatDuration(0.0000005, false) == "0.50ns");
+        CHECK(cadence::detail::FormatDuration(0.005025, false) == "5.03us");
+        CHECK(cadence::detail::FormatDuration(0.0686, false) == "68.6us");
+        CHECK(cadence::detail::FormatDuration(0.19, false) == "190us");
+        CHECK(cadence::detail::FormatDuration(2.0, false) == "2.00ms");
+        CHECK(cadence::detail::FormatDuration(1500.0, false) == "1.50s");
+        // The micro sign is two bytes in UTF-8, so the ASCII fallback is not merely cosmetic.
+        CHECK(cadence::detail::FormatDuration(0.0686, true) == "68.6\xc2\xb5s");
+    }
+
+    // The histogram is the only part of the report that shows shape rather than summary, so an empty bin must stay empty: that gap is what distinguishes a bimodal label from a merely wide one.
+    void TestHistogramRendering() {
+        std::array<std::uint32_t, cadence::NUM_HISTOGRAM_BINS> histogram{};
+        histogram[0] = 10;
+        histogram[11] = 5;
+        const std::string ascii = cadence::detail::RenderHistogram(histogram, false);
+        CHECK(ascii.size() == cadence::NUM_HISTOGRAM_BINS);
+        CHECK(ascii[0] == '#');
+        CHECK(ascii[1] == ' ');
+        CHECK(ascii[10] == ' ');
+        CHECK(ascii[11] != ' ');
+
+        // A label that never varied lands entirely in bin 0 and must not render as a blank row.
+        std::array<std::uint32_t, cadence::NUM_HISTOGRAM_BINS> flat{};
+        flat[0] = 42;
+        CHECK(cadence::detail::RenderHistogram(flat, false)[0] == '#');
+
+        // Nothing recorded renders as nothing at all, rather than as a row of noise.
+        std::array<std::uint32_t, cadence::NUM_HISTOGRAM_BINS> empty{};
+        CHECK(cadence::detail::RenderHistogram(empty, false).empty());
+    }
+
+    // A zero-nanosecond host span is a failed measurement, not a fast one, and letting one through pins the label's minimum at zero and stretches its jitter across a range nothing occupied.
+    void TestStalledClockSamplesAreDropped() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        registry.RecordHost("stalled", 2.0);
+        registry.RecordHost("stalled", 0.0);  // The clock did not move.
+        registry.RecordHost("stalled", 4.0);
+        cadence::Flush();
+
+        bool found = false;
+        const cadence::Stats row = Find("stalled", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 2);
+        CHECK_NEAR(row.minMs, 2.0, 1e-9);  // Not zero.
+        CHECK_NEAR(row.meanMs, 3.0, 1e-9);
+        CHECK(cadence::StalledClockCount() == 1);
+
+        // And the reader is told, rather than silently handed a thinner sample set.
+        std::ostringstream out;
+        cadence::WriteReport(out);
+        CHECK(out.str().find("monotonic clock did not advance") != std::string::npos);
+    }
+
+    // Samples land in the bin their magnitude earns, which is what makes the column readable at a glance.
+    void TestHistogramBinning() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 0; i < 20; ++i) registry.RecordHost("bimodal", 1.0);
+        for (int i = 0; i < 5; ++i) registry.RecordHost("bimodal", 10.0);
+        cadence::Flush();
+
+        bool found = false;
+        const cadence::Stats row = Find("bimodal", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.histogram[0] == 20);                              // The 1.0 ms cluster.
+        CHECK(row.histogram[cadence::NUM_HISTOGRAM_BINS - 1] == 5);  // The 10.0 ms cluster.
+        std::uint32_t total = 0;
+        for (std::uint32_t count : row.histogram) total += count;
+        CHECK(total == 25);
     }
 
     void TestResetClearsEverything() {
         cadence::Config config;
         config.warmupIterations = 0;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
@@ -224,7 +320,7 @@ namespace {
     void TestThreadSafeRecording() {
         cadence::Config config;
         config.warmupIterations = 0;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
@@ -251,15 +347,23 @@ namespace {
     void TestLabelInterningMergesByContent() {
         cadence::Config config;
         config.warmupIterations = 0;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         cadence::Configure(config);
         cadence::Reset();
 
+        // Each scope brackets real work. An empty scope can measure zero nanoseconds, and a zero-length span is discarded as a stalled clock, which would make the count below depend on timing rather than on interning.
         const std::string built = std::string("mer") + "ged";
         {
             CADENCE_SCOPE("merged");
+            BurnBriefly();
+        }
+        {
             cadence::ScopedHost fromRuntimeString(built.c_str());
+            BurnBriefly();
+        }
+        {
             cadence::ScopedHost fromOtherLiteral("merged");
+            BurnBriefly();
         }
         cadence::Flush();
 
@@ -296,13 +400,14 @@ namespace {
     void TestSamplingKeepsEveryNth() {
         cadence::Config config;
         config.warmupIterations = 0;
-        config.outputPath.clear();
+        config.reportStream = nullptr;
         config.sampleEvery = 5;
         cadence::Configure(config);
         cadence::Reset();
 
         for (int i = 0; i < 50; ++i) {
             CADENCE_SCOPE("sampled-host");
+            BurnBriefly();
         }
         cadence::Flush();
 
@@ -331,7 +436,11 @@ int main() {
         {"warmup persists across flushes", TestWarmupPersistsAcrossFlushes},
         {"scoped host timer", TestScopedHostMeasuresRealTime},
         {"runtime disable", TestRuntimeDisableStopsCollection},
-        {"csv output", TestCsvOutput},
+        {"report output", TestReportOutput},
+        {"duration formatting", TestDurationFormatting},
+        {"histogram rendering", TestHistogramRendering},
+        {"histogram binning", TestHistogramBinning},
+        {"stalled clock samples dropped", TestStalledClockSamplesAreDropped},
         {"reset", TestResetClearsEverything},
         {"environment overrides", TestEnvironmentOverridesWinOverStruct},
         {"thread-safe recording", TestThreadSafeRecording},

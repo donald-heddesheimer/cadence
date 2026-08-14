@@ -8,7 +8,7 @@
 int main() {
     cadence::Config config;
     config.warmupIterations = 0;
-    config.outputPath.clear();
+    config.reportStream = nullptr;
     CADENCE_CONFIGURE(config);   // Compiles to nothing; proven by the check below.
     cadence::Configure(config);  // The direct API still works, and suppresses the
                                  // exit-time write into the build directory.

@@ -167,7 +167,12 @@ namespace cadence {
                             samples.hasDevice = true;
                             if (KeepSample(samples, warmup)) {
                                 samples.deviceMs.push_back(static_cast<double>(elapsedMs));
-                                samples.hostMs.push_back(static_cast<double>(record.hostIssueNs) * 1e-6);
+                                // The GPU figure came from CUDA events and stands on its own; only the host half is dropped when the clock did not move, so a stalled clock costs you the issue-time row and nothing else.
+                                if (record.hostIssueNs > 0) {
+                                    samples.hostMs.push_back(static_cast<double>(record.hostIssueNs) * 1e-6);
+                                } else {
+                                    ++stalledClockRecords_;
+                                }
                             }
                         } else if (record.start || record.stop) {
                             ++failedRecords_;
@@ -177,10 +182,15 @@ namespace cadence {
                     }
                 }
 #endif
+                // A span of exactly zero nanoseconds is not a fast measurement, it is a failed one: two steady_clock reads with real work between them cannot return the same value. It happens on virtualized hosts, where CLOCK_MONOTONIC can hand back a stale value after a blocking call, and one such sample is enough to pin a label's minimum at zero and stretch its jitter and histogram across a range nothing ever occupied. Dropping it and saying so is more honest than reporting a number the machine did not measure.
                 for (const HostRecord& record : hostBatch) {
                     LabelSamples& samples = SamplesFor(record.label);
                     if (KeepSample(samples, warmup)) {
-                        samples.hostMs.push_back(static_cast<double>(record.elapsedNs) * 1e-6);
+                        if (record.elapsedNs > 0) {
+                            samples.hostMs.push_back(static_cast<double>(record.elapsedNs) * 1e-6);
+                        } else {
+                            ++stalledClockRecords_;
+                        }
                     }
                 }
             }
@@ -217,11 +227,18 @@ namespace cadence {
             std::lock_guard<std::mutex> lock(samplesMutex_);
             samples_.clear();
             failedRecords_ = 0;
+            stalledClockRecords_ = 0;
         }
 
         std::size_t FailedRecordCount() const {
             std::lock_guard<std::mutex> lock(samplesMutex_);
             return failedRecords_;
+        }
+
+        // Host spans discarded because the clock did not advance across them. Nonzero means the machine's monotonic clock is unreliable under load, not that the code being measured was fast.
+        std::size_t StalledClockCount() const {
+            std::lock_guard<std::mutex> lock(samplesMutex_);
+            return stalledClockRecords_;
         }
 
         // Suppresses the exit-time write: the application reported explicitly, and that report was taken while the CUDA runtime was certainly still alive.
@@ -231,10 +248,8 @@ namespace cadence {
         }
 
         void WriteTo(std::ostream& out) const {
-            Config configCopy = GetConfig();
-            std::size_t failed = FailedRecordCount();
-            WriteReportHeader(out, configCopy, QueryRunInfo(), failed);
-            WriteStatsCsv(out, Snapshot());
+            const Config configCopy = GetConfig();
+            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount());
         }
 
        private:
@@ -248,15 +263,18 @@ namespace cadence {
         static void AtExitHandler() {
             Registry& registry = Instance();
             const Config config = registry.GetConfig();
-            if (!config.writeOnExit || config.outputPath.empty()) return;
+            if (!config.writeOnExit) return;
             {
                 std::lock_guard<std::mutex> lock(registry.configMutex_);
                 if (registry.reported_) return;
             }
             // The CUDA runtime may already be shutting down; Flush() tolerates that and the report simply loses whatever was still pending.
             registry.Flush();
-            std::ofstream out(config.outputPath);
-            if (out) registry.WriteTo(out);
+            if (config.reportStream) registry.WriteTo(*config.reportStream);
+            if (!config.outputPath.empty()) {
+                std::ofstream out(config.outputPath);
+                if (out) registry.WriteTo(out);
+            }
         }
 
         unsigned WarmupIterations() const {
@@ -305,6 +323,7 @@ namespace cadence {
         mutable std::mutex samplesMutex_;
         std::vector<LabelSamples> samples_;
         std::size_t failedRecords_ = 0;
+        std::size_t stalledClockRecords_ = 0;
 
         std::mutex threadsMutex_;
         std::vector<std::shared_ptr<ThreadState>> threads_;
