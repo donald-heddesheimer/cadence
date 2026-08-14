@@ -342,6 +342,104 @@ namespace {
         CHECK(!Find("uncapped", cadence::ScopeKind::Host).estimated);
     }
 
+    // The summary says how often the loop missed; this says which passes did. Everything between two flushes is one iteration, and the slowest few are kept whole.
+    void TestWorstIterationsAreRetained() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.numWorstIterations = 3;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        // Ten iterations, each a loop scope plus one stage, with iteration i taking i milliseconds.
+        for (int i = 1; i <= 10; ++i) {
+            registry.RecordHost("iteration", static_cast<double>(i));
+            registry.RecordHost("stage", static_cast<double>(i) * 0.5);
+            cadence::Flush();
+        }
+
+        const std::vector<cadence::TraceIteration> worst = cadence::WorstIterations();
+        CHECK(worst.size() == 3);
+        // Slowest first, and ranked by the loop scope rather than by the sum of its parts.
+        CHECK_NEAR(worst[0].spanMs, 10.0, 1e-6);
+        CHECK_NEAR(worst[1].spanMs, 9.0, 1e-6);
+        CHECK_NEAR(worst[2].spanMs, 8.0, 1e-6);
+        // Each retained iteration keeps every stage that ran inside it.
+        CHECK(worst[0].spans.size() == 2);
+
+        bool sawIteration = false;
+        bool sawStage = false;
+        for (const cadence::TraceSpan& span : worst[0].spans) {
+            if (span.label == "iteration") { sawIteration = true; CHECK_NEAR(span.durationMs, 10.0, 1e-6); }
+            if (span.label == "stage") { sawStage = true; CHECK_NEAR(span.durationMs, 5.0, 1e-6); }
+        }
+        CHECK(sawIteration);
+        CHECK(sawStage);
+
+        std::ostringstream out;
+        cadence::WriteReport(out);
+        const std::string text = out.str();
+        CHECK(text.find("slowest iterations") != std::string::npos);
+
+        // Zero turns the section off entirely.
+        config.numWorstIterations = 0;
+        cadence::Configure(config);
+        cadence::Reset();
+        for (int i = 1; i <= 5; ++i) {
+            registry.RecordHost("iteration", static_cast<double>(i));
+            cadence::Flush();
+        }
+        CHECK(cadence::WorstIterations().empty());
+        std::ostringstream off;
+        cadence::WriteReport(off);
+        CHECK(off.str().find("slowest iterations") == std::string::npos);
+    }
+
+    // The trace is the same retained iterations in a format a timeline viewer opens. Exporting a whole run would be enormous and useless; exporting the passes that actually missed is neither.
+    void TestTraceJsonShape() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.numWorstIterations = 2;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 1; i <= 4; ++i) {
+            registry.RecordHost("loop\"quoted", static_cast<double>(i));
+            cadence::Flush();
+        }
+
+        std::ostringstream out;
+        cadence::WriteTrace(out);
+        const std::string json = out.str();
+
+        CHECK(json.find("\"traceEvents\"") != std::string::npos);
+        CHECK(json.find("\"displayTimeUnit\"") != std::string::npos);
+        CHECK(json.find("\"process_name\"") != std::string::npos);
+        CHECK(json.find("host (CPU)") != std::string::npos);
+        // A label carrying a quote has to come back out as valid JSON rather than as a broken file.
+        CHECK(json.find("loop\\\"quoted") != std::string::npos);
+        // Two iterations retained, one span each.
+        std::size_t spans = 0;
+        for (std::size_t at = json.find("\"ph\":\"X\""); at != std::string::npos; at = json.find("\"ph\":\"X\"", at + 1)) ++spans;
+        CHECK(spans == 2);
+        // Durations are microseconds in this format, so a 4 ms span is 4000.
+        CHECK(json.find("\"dur\":4000.000") != std::string::npos);
+        // Rebased so the earliest span sits at zero rather than at the steady clock's arbitrary origin.
+        CHECK(json.find("\"ts\":0.000") != std::string::npos);
+
+        // Braces balance, which is the cheapest proof the file is not truncated.
+        int depth = 0;
+        bool balanced = true;
+        for (char character : json) {
+            if (character == '{') ++depth;
+            if (character == '}' && --depth < 0) balanced = false;
+        }
+        CHECK(balanced && depth == 0);
+    }
+
     void TestBudgetCountsMisses() {
         cadence::Config config;
         config.warmupIterations = 0;
@@ -592,6 +690,8 @@ int main() {
         {"stalled clock samples dropped", TestStalledClockSamplesAreDropped},
         {"bounded retention keeps exact aggregates", TestBoundedRetentionKeepsExactAggregates},
         {"retention cap bounds memory", TestRetentionCapBoundsMemory},
+        {"worst iterations retained", TestWorstIterationsAreRetained},
+        {"trace json shape", TestTraceJsonShape},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},

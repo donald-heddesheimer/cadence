@@ -19,6 +19,7 @@
 #include "cadence/detail/report.h"
 #include "cadence/detail/stats.h"
 #include "cadence/detail/thread_state.h"
+#include "cadence/detail/trace.h"
 
 #if CADENCE_HAS_CUDA
 #include "cadence/detail/event_pool.h"
@@ -35,6 +36,24 @@ namespace cadence {
         std::uint64_t discarded = 0;  // Observations dropped as warmup.
         bool hasDevice = false;
     };
+
+#if CADENCE_HAS_CUDA
+    // The device a scope's events must be created on, which is the one its kernel launch will go to. Measured at 20.6 ns on an RTX A4000, against 1490 ns for the cudaEventRecord it protects.
+    CADENCE_ALWAYS_INLINE int CurrentDevice() {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 0;
+        return device;
+    }
+
+    // Ties the GPU clock to the host clock for one flush on one device.
+    //
+    // A CUDA event carries a GPU timestamp that no API converts to host time, so the only way to place GPU work on the host timeline is to observe one event completing at a known host instant and measure everything else against it with cudaEventElapsedTime. The observation has to be made on an event recorded for the purpose: reusing a stop event that finished earlier dates every span to whenever the flush happened to run, which is late by however much host code sat between the work finishing and the flush, and that is unbounded rather than small.
+    struct TraceAnchor {
+        cudaEvent_t event = nullptr;
+        std::int64_t hostNs = 0;
+        bool valid = false;
+    };
+#endif
 
     class Registry {
        public:
@@ -160,8 +179,22 @@ namespace cadence {
             const unsigned warmup = WarmupIterations();
             const double budgetMs = hotConfig.budgetMs.load(std::memory_order_relaxed);
             const std::size_t capacity = hotConfig.maxSamplesPerLabel.load(std::memory_order_relaxed);
+            const std::size_t numWorst = hotConfig.numWorstIterations.load(std::memory_order_relaxed);
+
+            // Everything flushed here belongs to one pass of the caller's loop, which is what makes a flush boundary the natural definition of an iteration. Spans are gathered into a member buffer rather than a local one so that the steady state, where an iteration is measured and then found not to be among the worst, allocates nothing.
+            bool sawHostScope = false;
+            const std::uint64_t iterationIndex = flushGeneration_.load(std::memory_order_relaxed) - 1;
+
+#if CADENCE_HAS_CUDA
+            // A host span already knows where it sits on the clock; only GPU spans need placing, so this is read on the device path alone.
+            const bool tracing = hotConfig.traceEnabled.load(std::memory_order_relaxed);
+            // A GPU span knows its length but not its position, so one event per device is recorded onto a now-drained stream and watched until it completes. The host time bracketing that wait dates the GPU's clock, and cudaEventElapsedTime places every other span against it. Only done when a trace is being written, because it costs an event record and a synchronize per flush.
+            std::vector<TraceAnchor> anchors;
+            if (tracing) anchors = RecordTraceAnchors(deviceBatches);
+#endif
             {
                 std::lock_guard<std::mutex> lock(samplesMutex_);
+                iterationSpans_.clear();
 #if CADENCE_HAS_CUDA
                 for (const std::vector<DeviceRecord>& batch : deviceBatches) {
                     for (const DeviceRecord& record : batch) {
@@ -180,6 +213,31 @@ namespace cadence {
                                 } else {
                                     ++stalledClockRecords_;
                                 }
+                                if (numWorst > 0) {
+                                    IterationSpan span;
+                                    span.label = record.label;
+                                    span.kind = ScopeKind::Device;
+                                    span.durationMs = static_cast<double>(elapsedMs);
+                                    span.lane = LaneFor(record.stream);
+                                    const std::size_t deviceIndex = record.device < 0 ? 0 : static_cast<std::size_t>(record.device);
+                                    if (tracing && deviceIndex < anchors.size() && anchors[deviceIndex].valid) {
+                                        float msBeforeAnchor = 0.0f;
+                                        if (cudaEventElapsedTime(&msBeforeAnchor, record.start, anchors[deviceIndex].event) == cudaSuccess) {
+                                            span.startNs = anchors[deviceIndex].hostNs - static_cast<std::int64_t>(static_cast<double>(msBeforeAnchor) * 1e6);
+                                        }
+                                    }
+                                    iterationSpans_.push_back(span);
+                                    // The CPU-issue side goes on the host lane, but only for a trace. Seeing the launch sitting well ahead of the kernel it launched is the whole reason to look at a timeline; in the report's breakdown it would just be a second row per label saying what the summary table already says.
+                                    if (tracing && record.hostIssueNs > 0) {
+                                        IterationSpan issue;
+                                        issue.label = record.label;
+                                        issue.kind = ScopeKind::Host;
+                                        issue.durationMs = static_cast<double>(record.hostIssueNs) * 1e-6;
+                                        issue.startNs = record.hostStartNs;
+                                        issue.lane = 0;
+                                        iterationSpans_.push_back(issue);
+                                    }
+                                }
                             }
                         } else if (record.start || record.stop) {
                             ++failedRecords_;
@@ -197,10 +255,25 @@ namespace cadence {
                     if (KeepSample(samples, warmup)) {
                         if (record.elapsedNs > 0) {
                             samples.host.Add(static_cast<double>(record.elapsedNs) * 1e-6, budgetMs, capacity);
+                            if (numWorst > 0) {
+                                IterationSpan span;
+                                span.label = record.label;
+                                span.kind = ScopeKind::Host;
+                                span.durationMs = static_cast<double>(record.elapsedNs) * 1e-6;
+                                span.startNs = record.startNs;
+                                span.lane = 0;
+                                iterationSpans_.push_back(span);
+                                sawHostScope = true;
+                            }
                         } else {
                             ++stalledClockRecords_;
                         }
                     }
+                }
+
+                // Inside the lock, because this is where worst_ is written and Snapshot reads it from another thread.
+                if (numWorst > 0 && !iterationSpans_.empty()) {
+                    RetainIfWorst(iterationIndex, IterationSpanMs(iterationSpans_, sawHostScope), numWorst);
                 }
             }
 
@@ -240,12 +313,38 @@ namespace cadence {
             return results;
         }
 
+        // The slowest iterations kept so far, slowest first, with their labels resolved. Ordered by the same measure the report ranks them by.
+        std::vector<TraceIteration> WorstIterations() const {
+            const std::vector<std::string> names = LabelTable::Instance().Names();
+            std::lock_guard<std::mutex> lock(samplesMutex_);
+            std::vector<TraceIteration> resolved;
+            resolved.reserve(worst_.size());
+            for (const IterationRecord& record : worst_) {
+                TraceIteration iteration;
+                iteration.index = record.index;
+                iteration.spanMs = record.spanMs;
+                iteration.spans.reserve(record.spans.size());
+                for (const IterationSpan& span : record.spans) {
+                    TraceSpan resolvedSpan;
+                    resolvedSpan.label = span.label < names.size() ? names[span.label] : std::string();
+                    resolvedSpan.kind = span.kind;
+                    resolvedSpan.durationMs = span.durationMs;
+                    resolvedSpan.startNs = span.startNs;
+                    resolvedSpan.lane = span.lane;
+                    iteration.spans.push_back(std::move(resolvedSpan));
+                }
+                resolved.push_back(std::move(iteration));
+            }
+            return resolved;
+        }
+
         void Reset() {
 #if CADENCE_HAS_CUDA
             capturedScopes_.store(0, std::memory_order_relaxed);
 #endif
             std::lock_guard<std::mutex> lock(samplesMutex_);
             samples_.clear();
+            worst_.clear();
             failedRecords_ = 0;
             stalledClockRecords_ = 0;
         }
@@ -274,8 +373,10 @@ namespace cadence {
 #else
             const std::size_t captured = 0;
 #endif
-            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount(), captured);
+            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount(), captured, WorstIterations());
         }
+
+        void WriteTraceTo(std::ostream& out) const { WriteTraceJson(out, WorstIterations()); }
 
        private:
         Registry() {
@@ -348,6 +449,84 @@ namespace cadence {
             return target;
         }
 
+        // Called with samplesMutex_ held. Keeps the list sorted slowest first and no longer than it needs to be, so an iteration that is not among the worst costs one comparison and nothing else. The scratch buffer is handed over only when the iteration is actually kept, which is the rare case.
+        void RetainIfWorst(std::uint64_t index, double spanMs, std::size_t numWorst) {
+            if (worst_.size() >= numWorst && spanMs <= worst_.back().spanMs) return;
+            IterationRecord kept;
+            kept.index = index;
+            kept.spanMs = spanMs;
+            kept.spans = iterationSpans_;
+            auto position = worst_.begin();
+            while (position != worst_.end() && position->spanMs >= spanMs) ++position;
+            worst_.insert(position, std::move(kept));
+            if (worst_.size() > numWorst) worst_.resize(numWorst);
+        }
+
+#if CADENCE_HAS_CUDA
+        // One anchor per device that recorded anything in this flush. Called after every stop event has been waited on, so the streams are drained and the anchor completes almost immediately; the remaining error is half the latency of the synchronize returning, which is why the host clock is read on both sides of it and the midpoint taken.
+        std::vector<TraceAnchor> RecordTraceAnchors(const std::vector<std::vector<DeviceRecord>>& batches) {
+            std::vector<cudaStream_t> streams;
+            std::vector<bool> present;
+            for (const std::vector<DeviceRecord>& batch : batches) {
+                for (const DeviceRecord& record : batch) {
+                    if (!record.stop) continue;
+                    const std::size_t index = record.device < 0 ? 0 : static_cast<std::size_t>(record.device);
+                    if (index >= present.size()) {
+                        present.resize(index + 1, false);
+                        streams.resize(index + 1, nullptr);
+                    }
+                    if (!present[index]) {
+                        present[index] = true;
+                        streams[index] = record.stream;
+                    }
+                }
+            }
+
+            std::vector<TraceAnchor> anchors(present.size());
+            if (present.empty()) return anchors;
+
+            // cudaEventCreate binds to the current device, so making an anchor for another one means briefly making it current. In the ordinary single-device case the guard never fires.
+            const int previousDevice = CurrentDevice();
+            int activeDevice = previousDevice;
+            for (std::size_t index = 0; index < present.size(); ++index) {
+                if (!present[index]) continue;
+                const int device = static_cast<int>(index);
+                if (device != activeDevice) {
+                    if (cudaSetDevice(device) != cudaSuccess) continue;
+                    activeDevice = device;
+                }
+                cudaEvent_t anchor = AnchorEventFor(index);
+                if (!anchor || cudaEventRecord(anchor, streams[index]) != cudaSuccess) continue;
+                const std::int64_t before = NowNs();
+                if (cudaEventSynchronize(anchor) != cudaSuccess) continue;
+                const std::int64_t after = NowNs();
+                anchors[index].event = anchor;
+                anchors[index].hostNs = before + (after - before) / 2;
+                anchors[index].valid = true;
+            }
+            if (activeDevice != previousDevice) cudaSetDevice(previousDevice);
+            return anchors;
+        }
+
+        // Owned by the registry and reused every flush, so tracing does not churn the event pool. Created with the matching device current.
+        cudaEvent_t AnchorEventFor(std::size_t device) {
+            if (device >= anchorEvents_.size()) anchorEvents_.resize(device + 1, nullptr);
+            if (!anchorEvents_[device] && cudaEventCreate(&anchorEvents_[device]) != cudaSuccess) {
+                anchorEvents_[device] = nullptr;
+            }
+            return anchorEvents_[device];
+        }
+
+        // Called with samplesMutex_ held. A trace viewer wants a small dense row index rather than a pointer, and a process uses a handful of streams, so a scan is the whole implementation. Lane 0 is reserved for the host.
+        int LaneFor(cudaStream_t stream) {
+            for (std::size_t i = 0; i < lanes_.size(); ++i) {
+                if (lanes_[i] == stream) return static_cast<int>(i) + 1;
+            }
+            lanes_.push_back(stream);
+            return static_cast<int>(lanes_.size());
+        }
+#endif
+
         // Called with samplesMutex_ held. Each set's reservoir is seeded from the label it belongs to, so which observations survive a capped run is reproducible from one run to the next.
         LabelSamples& SamplesFor(LabelId id) {
             if (id >= samples_.size()) {
@@ -397,6 +576,12 @@ namespace cadence {
         std::vector<LabelSamples> samples_;
         std::size_t failedRecords_ = 0;
         std::size_t stalledClockRecords_ = 0;
+        std::vector<IterationRecord> worst_;  // Slowest first, never longer than numWorstIterations.
+        std::vector<IterationSpan> iterationSpans_;  // Reused every flush so the steady state does not allocate.
+#if CADENCE_HAS_CUDA
+        std::vector<cudaStream_t> lanes_;
+        std::vector<cudaEvent_t> anchorEvents_;  // One per device, reused by every flush that builds a trace.
+#endif
 
         std::mutex threadsMutex_;
         std::vector<std::shared_ptr<ThreadState>> threads_;
@@ -439,9 +624,12 @@ namespace cadence {
     // Defined out of line because it needs TlsState(), which needs Registry to be a complete type.
     inline void Registry::RecordHost(const char* label, double elapsedMs) {
         const LabelHandle handle = LabelTable::Instance().Intern(label);
+        const std::int64_t elapsedNs = static_cast<std::int64_t>(elapsedMs * 1e6);
+        // The caller supplied a duration but no position, so the span is dated to now and runs backwards from it. That is the only placement available and it is right to within the time since the work actually happened.
+        const std::int64_t endNs = NowNs();
         ThreadState& state = TlsState();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.pendingHost.push_back(HostRecord{handle.id, static_cast<std::int64_t>(elapsedMs * 1e6)});
+        state.pendingHost.push_back(HostRecord{handle.id, endNs - elapsedNs, elapsedNs});
     }
 
     // One observation in every `sampleEvery`. The counter lives in the label handle, so this costs an increment on a cache line only this label touches; the common case is sampleEvery == 1 and a branch the predictor gets right every time.
@@ -454,13 +642,6 @@ namespace cadence {
     }
 
 #if CADENCE_HAS_CUDA
-    // The device a scope's events must be created on, which is the one its kernel launch will go to. Measured at 20.6 ns on an RTX A4000, against 1490 ns for the cudaEventRecord it protects.
-    CADENCE_ALWAYS_INLINE int CurrentDevice() {
-        int device = 0;
-        if (cudaGetDevice(&device) != cudaSuccess) return 0;
-        return device;
-    }
-
     // True when nothing may be recorded on this stream because it is being captured into a CUDA graph.
     //
     // Recording anyway is not a matter of collecting a wrong number. cudaEventRecord succeeds during capture, but the event is baked into the graph rather than executed, and from then on every cudaEventSynchronize and cudaEventElapsedTime against it fails. Flushing while capture is still open poisons the capture outright: cudaStreamEndCapture then returns an error and hands the application back a null graph. Flushing after it closes leaves the graph intact but the events permanently unreadable, and recycling one into the pool hands an unrelated scope a handle that the instantiated graph silently re-records on every replay. Measured at 39.5 ns per check.

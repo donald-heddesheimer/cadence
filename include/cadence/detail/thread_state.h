@@ -4,6 +4,7 @@
 // The block outlives its thread. Flush() may be walking it at the moment the thread exits, so ownership is shared and the thread merely marks it retired on the way out; the registry drops it once it is both retired and drained.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -14,9 +15,15 @@
 namespace cadence {
     namespace detail {
 
+    // Absolute nanoseconds on the steady clock. Spans need a position as well as a length before they can be drawn on a timeline, and one origin shared by every scope is what lets a host span and a GPU span be compared at all. Lives beside the records that store its result.
+    CADENCE_ALWAYS_INLINE std::int64_t NowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     // Elapsed times are carried as raw clock ticks and converted to milliseconds at flush
     struct HostRecord {
         LabelId label;
+        std::int64_t startNs;  // steady_clock since its epoch. Carried so a span can be placed on a timeline, not just measured.
         std::int64_t elapsedNs;
     };
 
@@ -28,7 +35,8 @@ namespace cadence {
         cudaStream_t stream;
         cudaEvent_t start;
         cudaEvent_t stop;
-        std::int64_t hostIssueNs; // cpu time spent in scope
+        std::int64_t hostStartNs;  // When the CPU began issuing, on the same clock as HostRecord.
+        std::int64_t hostIssueNs;  // cpu time spent in scope
     };
 
     // The open end of a stage chain on one stream.

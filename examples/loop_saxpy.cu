@@ -43,6 +43,8 @@ int main() {
     config.warmupIterations = 10;  // Discard context creation and autotuning.
     // A loop that has to close at 12.5 kHz. With no label named, the budget lands on the one scope that never launched a kernel, which is the "iteration" span below.
     config.budgetMs = 0.080;
+    // The slowest iterations get written out as a timeline. Open it at https://ui.perfetto.dev to see the launches on the host lane and the kernels they queued on the device lane.
+    config.tracePath = "worst.json";
     cadence::Configure(config);
 
     float* deviceX = nullptr;

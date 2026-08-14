@@ -45,6 +45,12 @@ namespace cadence {
 
         // Observations retained per label per row before new ones start replacing old ones at random rather than accumulating. Bounds a long run's memory: count, mean, stddev, min, max and the deadline verdict stay exact regardless, and only the percentiles and the histogram become estimates. Zero retains everything, which is what a short benchmark wants and what a loop left running for a week does not.
         std::size_t maxSamplesPerLabel = NUM_SAMPLES_RETAINED;
+
+        // Slowest iterations kept whole, with every stage that ran inside them, and printed as a breakdown under the table. This is the question the summary raises and cannot answer: not how often the loop missed, but which passes missed and what was slow in them. Costs one small vector per retained iteration and no extra CUDA work. Zero turns the section off.
+        std::size_t numWorstIterations = 3;
+
+        // Where to write a Chrome Trace Event JSON file of those retained iterations, openable at https://ui.perfetto.dev. Empty means no trace, which is the default because placing GPU spans on the host timeline costs an extra elapsed-time query per record at flush.
+        std::string tracePath;
     };
 
     namespace detail {
@@ -56,6 +62,9 @@ namespace cadence {
         // Read by Flush() rather than by a scope. Counting misses as observations arrive is what keeps the deadline verdict exact once the reservoir starts discarding samples; the cost is that a budget changed part way through a run is only applied to what came after it.
         std::atomic<double> budgetMs{0.0};
         std::atomic<std::size_t> maxSamplesPerLabel{NUM_SAMPLES_RETAINED};
+        std::atomic<std::size_t> numWorstIterations{3};
+        // Whether flush should place spans on an absolute timeline. Only a trace needs that, and it is not free, so the flush path reads this rather than the path string.
+        std::atomic<bool> traceEnabled{false};
     };
 
     inline HotConfig hotConfig;
@@ -66,6 +75,8 @@ namespace cadence {
         hotConfig.sampleEvery.store(config.sampleEvery < 1 ? 1 : config.sampleEvery, std::memory_order_relaxed);
         hotConfig.budgetMs.store(config.budgetMs, std::memory_order_relaxed);
         hotConfig.maxSamplesPerLabel.store(config.maxSamplesPerLabel, std::memory_order_relaxed);
+        hotConfig.numWorstIterations.store(config.numWorstIterations, std::memory_order_relaxed);
+        hotConfig.traceEnabled.store(!config.tracePath.empty(), std::memory_order_relaxed);
     }
 
     inline const char* EnvOrNull(const char* name) {
@@ -81,7 +92,7 @@ namespace cadence {
         return fallback;
     }
 
-    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES.
+    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES, CADENCE_WORST, CADENCE_TRACE.
     inline void ApplyEnvironmentOverrides(Config& config) {
         if (const char* warmup = EnvOrNull("CADENCE_WARMUP")) {
             config.warmupIterations = static_cast<unsigned>(std::strtoul(warmup, nullptr, 10));
@@ -95,6 +106,12 @@ namespace cadence {
         }
         if (const char* retained = EnvOrNull("CADENCE_MAX_SAMPLES")) {
             config.maxSamplesPerLabel = static_cast<std::size_t>(std::strtoull(retained, nullptr, 10));
+        }
+        if (const char* worst = EnvOrNull("CADENCE_WORST")) {
+            config.numWorstIterations = static_cast<std::size_t>(std::strtoull(worst, nullptr, 10));
+        }
+        if (const char* trace = EnvOrNull("CADENCE_TRACE")) {
+            config.tracePath = trace;
         }
         config.nvtxEnabled = ParseBool(EnvOrNull("CADENCE_NVTX"), config.nvtxEnabled);
         config.enabled = ParseBool(EnvOrNull("CADENCE_ENABLE"), config.enabled);

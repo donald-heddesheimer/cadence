@@ -17,6 +17,7 @@
 #include "cadence/detail/config.h"
 #include "cadence/detail/platform.h"
 #include "cadence/detail/stats.h"
+#include "cadence/detail/trace.h"
 
 namespace cadence {
 
@@ -292,13 +293,35 @@ namespace cadence {
         out << "            [" << bar << "]  p95 " << FormatDuration(held->p95Ms, unicode) << " at " << p95Share << "\n";
     }
 
-    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0) {
+    // The slowest passes of the loop, broken down by stage. The table above says how often the loop missed; this says which passes did and where the time went in them, which is the question the table always raises next. A miss is usually one stage rather than everything being slightly slow, and that is visible here and nowhere else in the report.
+    inline void WriteWorstIterations(std::ostream& out, const std::vector<TraceIteration>& worst, bool unicode) {
+        if (worst.empty()) return;
+        out << "\n  slowest iterations\n";
+        for (const TraceIteration& iteration : worst) {
+            std::string head = "    #" + std::to_string(iteration.index);
+            PadTo(head, 10);
+            out << head << RightAligned(FormatDuration(iteration.spanMs, unicode), 8) << "  ";
+            // Device spans only. The host-issue side of each label is carried for the trace, where seeing a launch sit ahead of its kernel is the point, but repeating it here would say what the summary table already said.
+            bool firstSpan = true;
+            for (const TraceSpan& span : iteration.spans) {
+                if (span.kind != ScopeKind::Device) continue;
+                if (!firstSpan) out << (unicode ? " \xc2\xb7 " : " | ");  // U+00B7 MIDDLE DOT
+                firstSpan = false;
+                out << span.label << " " << FormatDuration(span.durationMs, unicode);
+            }
+            if (firstSpan) out << "no GPU work recorded";
+            out << "\n";
+        }
+    }
+
+    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0, const std::vector<TraceIteration>& worst = {}) {
         const bool unicode = config.unicodeOutput;
         bool anyEstimated = false;
         for (const Stats& row : stats) anyEstimated = anyEstimated || row.estimated;
         WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, anyEstimated);
         WriteStatsTable(out, stats, unicode);
         WriteBudget(out, stats, unicode);
+        WriteWorstIterations(out, worst, unicode);
         WriteSummary(out, stats, unicode);
         out << "\n  elapsed time only; for occupancy or bandwidth use `ncu`.\n";
         out.flush();

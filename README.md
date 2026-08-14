@@ -85,6 +85,52 @@ around your iteration. Set `cfg.budgetLabel` to hold a specific stage instead;
 a named label with GPU work is held to its GPU time. If the choice is ambiguous
 (two host-only labels, say), no row carries the budget rather than the wrong one.
 
+## Which iteration was slow, and why
+
+A distribution tells you the loop missed. It cannot tell you which passes missed
+or what was slow in them, because by the time an outlier reaches the histogram
+it is one mark with nothing behind it. cadence keeps the slowest iterations
+whole and prints their breakdown:
+
+```
+  slowest iterations
+    #61      609µs  saxpy 37.6µs · scale 24.6µs
+    #67      169µs  saxpy 37.0µs · scale 115µs
+    #64      141µs  saxpy 38.9µs · scale 25.6µs
+```
+
+Those are two different faults. Iteration 61 took 609 µs with only 62 µs of GPU
+work in it, so the time went somewhere the GPU was not: a stalled CPU, a page
+fault, a preempted thread. Iteration 67 is the opposite, with `scale` taking
+115 µs against its usual 25. One is a host problem and one is a device problem,
+and the summary table shows both as the same tall bar on the right of the
+histogram.
+
+An iteration is everything recorded between two flushes. Ranking is by the
+`CADENCE_SCOPE` wrapped around the loop body, which is the pass's own duration.
+This costs nothing measurable and is on by default; set `numWorstIterations` to
+0 to turn it off.
+
+### Timelines
+
+Point `tracePath` at a file and the same retained iterations are written as
+Chrome Trace Event JSON, which [ui.perfetto.dev](https://ui.perfetto.dev) opens
+directly:
+
+```cpp
+cfg.tracePath = "worst.json";
+```
+
+You get one lane for the CPU and one per CUDA stream, so a launch sitting well
+ahead of the kernel it queued is visible as a gap rather than inferred from two
+columns of numbers. Only the worst iterations are exported: a trace of an entire
+run is both enormous and useless, since nobody scrolls a million spans looking
+for the bad one.
+
+GPU spans are placed on the host clock by recording one anchor event per flush
+and watching it complete, so device and host lanes share a timeline. That costs
+about 5.6 µs per flush, which is why tracing is off unless you ask for it.
+
 ## Where it fits
 
 | | Answers | How you run it | Usable in a live loop? |
@@ -106,6 +152,8 @@ added shows up on the Nsight timeline at no extra cost.
 - **No synchronization on the hot path.** Event pairs are buffered and resolved at `CADENCE_FLUSH()`, which you put at a boundary where you were going to synchronize anyway. Instrumentation never serializes the pipeline it is measuring.
 - **Distributions rather than averages.** mean, min, p50, p95, max, stddev, and jitter (max minus min) for every label. A loop with a deadline is decided by its tail.
 - **Deadline reporting.** Give a stage a budget and the report says how many iterations held it, rather than leaving you to infer it from a percentile.
+- **The slowest iterations, kept whole.** Not just how often the loop missed but which passes did and where their time went, which is the question a distribution raises and cannot answer. Free, and on by default.
+- **Timeline export.** Those same iterations write out as Chrome Trace Event JSON for [ui.perfetto.dev](https://ui.perfetto.dev), with CPU and GPU on a shared clock, so a launch stalled ahead of its kernel is something you see rather than deduce.
 - **CPU and GPU through the same API.** The host timers compile in translation units with no CUDA in them, so one set of macros covers the whole pipeline.
 - **Tunable overhead.** `CADENCE_STAGE` halves the number of events recorded, and `sampleEvery` measures one iteration in N. Both are opt-in, and [docs/overhead.md](docs/overhead.md) is explicit about what each one costs you in visibility.
 - **Bounded memory.** Observations per label are capped, so a loop left running for a week costs the same as one running for a minute. Count, mean, stddev, min, max and the deadline verdict stay exact past the cap; only the percentiles and the histogram become estimates, drawn from a uniform sample of the whole run rather than a recent window.
@@ -155,17 +203,23 @@ cfg.sampleEvery = 1;         // measure one iteration in N
 cfg.budgetMs = 0.100;        // deadline for one stage; 0 disables the check
 cfg.budgetLabel = "";        // which stage; empty picks the loop span
 cfg.maxSamplesPerLabel = 32768;  // retained per row; 0 keeps every observation
+cfg.numWorstIterations = 3;  // slowest iterations kept whole; 0 turns the section off
+cfg.tracePath = "worst.json";  // also write those as a Perfetto-openable timeline
 cfg.nvtxEnabled = true;
 cadence::Configure(cfg);
 
 std::vector<cadence::Stats> rows = cadence::Snapshot();  // assert on these in tests
+std::vector<cadence::TraceIteration> worst = cadence::WorstIterations();
+cadence::WriteTrace("worst.json");                       // or render it yourself
 cadence::Reset();                                        // drop stats, restart warmup
 ```
 
 `CADENCE_WARMUP`, `CADENCE_OUTPUT`, `CADENCE_NVTX`, `CADENCE_SAMPLE`,
 `CADENCE_UNICODE`, `CADENCE_BUDGET_MS`, `CADENCE_BUDGET_LABEL`,
-`CADENCE_MAX_SAMPLES` and `CADENCE_ENABLE` override the config from the
-environment, so a deployed binary can be re-pointed without a rebuild.
+`CADENCE_MAX_SAMPLES`, `CADENCE_WORST`, `CADENCE_TRACE` and `CADENCE_ENABLE`
+override the config from the environment, so a deployed binary can be
+re-pointed without a rebuild. That makes tracing something you can switch on for
+one run of an already-deployed process: `CADENCE_TRACE=worst.json ./app`.
 
 Set the budget before the loop starts. Misses are counted as observations
 arrive, which is what keeps the verdict exact on a run long enough to outgrow

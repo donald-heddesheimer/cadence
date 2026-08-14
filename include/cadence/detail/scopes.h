@@ -18,13 +18,6 @@
 #include "cadence/detail/registry.h"
 
 namespace cadence {
-    namespace detail {
-
-    CADENCE_ALWAYS_INLINE std::int64_t ElapsedNs(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
-    }
-
-    }  // namespace detail
 
     // A host-side span measured with steady_clock. Usable in plain C++ translation units with no CUDA in sight.
     class ScopedHost {
@@ -33,7 +26,7 @@ namespace cadence {
             : labelId_(label.id),
               active_(detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSample(label)),
               nvtx_(label.name, active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
-            if (CADENCE_LIKELY(active_)) start_ = std::chrono::steady_clock::now();
+            if (CADENCE_LIKELY(active_)) startNs_ = detail::NowNs();
         }
 
         // Interns on every construction, and takes a lock to do it. CADENCE_SCOPE resolves the label once per call site instead; prefer it.
@@ -42,11 +35,10 @@ namespace cadence {
 
         ~ScopedHost() {
             if (!active_) return;
-            const auto end = std::chrono::steady_clock::now();
-            const std::int64_t elapsedNs = detail::ElapsedNs(start_, end);
+            const std::int64_t endNs = detail::NowNs();
             detail::ThreadState& state = detail::TlsState();
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.pendingHost.push_back(detail::HostRecord{labelId_, elapsedNs});
+            state.pendingHost.push_back(detail::HostRecord{labelId_, startNs_, endNs - startNs_});
         }
 
         ScopedHost(const ScopedHost&) = delete;
@@ -56,7 +48,7 @@ namespace cadence {
         detail::LabelId labelId_;
         bool active_;
         detail::NvtxRange nvtx_;
-        std::chrono::steady_clock::time_point start_{};
+        std::int64_t startNs_ = 0;
     };
 
 #if CADENCE_HAS_CUDA
@@ -85,11 +77,11 @@ namespace cadence {
             if (CADENCE_UNLIKELY(!start_ || !stop_)) {
                 // Out of events: stay quiet rather than taking the application down, but hand back whatever was taken so the count stays honest.
                 active_ = false;
-                Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, stop_, 0});
+                Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, stop_, 0, 0});
                 start_ = stop_ = nullptr;
                 return;
             }
-            hostStart_ = std::chrono::steady_clock::now();
+            hostStartNs_ = detail::NowNs();
             cudaEventRecord(start_, stream_);
         }
 
@@ -106,9 +98,9 @@ namespace cadence {
                 return;
             }
             cudaEventRecord(stop_, stream_);
-            const auto hostEnd = std::chrono::steady_clock::now();
+            const std::int64_t hostEndNs = detail::NowNs();
             detail::ThreadState& state = detail::TlsState();
-            Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, stop_, detail::ElapsedNs(hostStart_, hostEnd)});
+            Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, stop_, hostStartNs_, hostEndNs - hostStartNs_});
         }
 
         ScopedKernel(const ScopedKernel&) = delete;
@@ -127,7 +119,7 @@ namespace cadence {
         int device_ = 0;
         bool active_;
         detail::NvtxRange nvtx_;
-        std::chrono::steady_clock::time_point hostStart_{};
+        std::int64_t hostStartNs_ = 0;
     };
 
     // Times one stage of a chain, using the previous stage's stop event as its start. 
@@ -165,7 +157,7 @@ namespace cadence {
                 ownsStart_ = true;
             }
             start_ = chain->tail;
-            hostStart_ = std::chrono::steady_clock::now();
+            hostStartNs_ = detail::NowNs();
         }
 
         explicit ScopedStage(const char* label, cudaStream_t stream = 0)
@@ -182,13 +174,13 @@ namespace cadence {
                 return;
             }
             cudaEvent_t stop = detail::TakeEvent(state, device_);
-            const auto hostEnd = std::chrono::steady_clock::now();
+            const std::int64_t hostEndNs = detail::NowNs();
             detail::StreamChain* chain = state.FindChain(stream_);
             if (CADENCE_UNLIKELY(!stop)) {
                 // Break the chain rather than leave a head nobody will ever release; the record carries the orphan back to the pool via Flush().
                 chain->tail = nullptr;
                 if (ownsStart_) {
-                    Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, nullptr, 0});
+                    Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, nullptr, 0, 0});
                 }
                 return;
             }
@@ -196,7 +188,7 @@ namespace cadence {
             chain->tail = stop;
             chain->generation = generation_;
             chain->device = device_;
-            Append(state, detail::DeviceRecord{labelId_, ownsStart_, device_, stream_, start_, stop, detail::ElapsedNs(hostStart_, hostEnd)});
+            Append(state, detail::DeviceRecord{labelId_, ownsStart_, device_, stream_, start_, stop, hostStartNs_, hostEndNs - hostStartNs_});
         }
 
         ScopedStage(const ScopedStage&) = delete;
@@ -217,7 +209,7 @@ namespace cadence {
         bool ownsStart_ = false;
         std::uint64_t generation_ = 0;
         detail::NvtxRange nvtx_;
-        std::chrono::steady_clock::time_point hostStart_{};
+        std::int64_t hostStartNs_ = 0;
     };
 
 #endif  // CADENCE_HAS_CUDA

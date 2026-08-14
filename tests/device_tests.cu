@@ -36,6 +36,15 @@ namespace {
     constexpr int NUM_BLOCKS = 256;
     constexpr int NUM_THREADS = 256;
 
+    // Slack allowed when checking where a GPU span landed on the host clock. The anchor is dated to the midpoint of the bracket around its synchronize, which leaves a residual of a microsecond or two; measured margins run from about 1 us to several hundred.
+    constexpr std::int64_t TRACE_TOLERANCE_NS = 50000;
+
+    void BurnHostMicroseconds(int microseconds) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(microseconds);
+        while (std::chrono::steady_clock::now() < until) {
+        }
+    }
+
     double DeviceMs(const std::vector<cadence::Stats>& snapshot, const std::string& label) {
         for (const cadence::Stats& row : snapshot) {
             if (row.label == label && row.kind == cadence::ScopeKind::Device) return row.meanMs;
@@ -342,6 +351,76 @@ namespace {
         ResetLibrary(0, 1);
     }
 
+    // The invariant that decides whether a trace is worth opening: a GPU span has to sit inside the host scope that launched and waited for it. A CUDA event carries a GPU timestamp no API converts to host time, so the placement comes from watching one anchor event complete at a known host instant. Anchor it wrongly and every span still looks plausible in isolation while the timeline as a whole is fiction, which is why this asserts containment rather than merely that timestamps are non-zero.
+    void TestTraceSpansNestInsideTheirHostScope(float* sink, cudaStream_t stream) {
+        cadence::Config config;
+        config.reportStream = nullptr;
+        config.warmupIterations = 0;
+        config.nvtxEnabled = false;
+        config.writeOnExit = false;
+        config.numWorstIterations = 4;
+        config.tracePath = "unused-the-test-reads-the-spans-directly.json";
+        cadence::Configure(config);
+        cadence::Reset();
+
+        for (int i = 0; i < 20; ++i) {
+            {
+                CADENCE_SCOPE("iteration");
+                {
+                    CADENCE_KERNEL("first", stream);
+                    Spin<<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(sink, SPIN_UNIT);
+                }
+                {
+                    CADENCE_KERNEL("second", stream);
+                    Spin<<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(sink, SPIN_UNIT);
+                }
+                cudaStreamSynchronize(stream);
+            }
+            // Host work between the scope closing and the flush, which is what a real loop does and what separates a correct anchor from a plausible one. Dating spans from when the flush ran rather than from an event recorded for the purpose shifts every GPU span later by exactly this delay.
+            BurnHostMicroseconds(1000);
+            cadence::Flush();
+        }
+
+        const std::vector<cadence::TraceIteration> worst = cadence::WorstIterations();
+        Check(!worst.empty(), "the trace retained at least one iteration");
+
+        int checked = 0;
+        int contained = 0;
+        int ordered = 0;
+        for (const cadence::TraceIteration& iteration : worst) {
+            const cadence::TraceSpan* loop = nullptr;
+            for (const cadence::TraceSpan& span : iteration.spans) {
+                if (span.label == "iteration" && span.kind == cadence::ScopeKind::Host) loop = &span;
+            }
+            if (!loop) continue;
+            const std::int64_t loopStart = loop->startNs;
+            const std::int64_t loopEnd = loopStart + static_cast<std::int64_t>(loop->durationMs * 1e6);
+            const cadence::TraceSpan* first = nullptr;
+            const cadence::TraceSpan* second = nullptr;
+            for (const cadence::TraceSpan& span : iteration.spans) {
+                if (span.kind != cadence::ScopeKind::Device) continue;
+                ++checked;
+                const std::int64_t spanStart = span.startNs;
+                const std::int64_t spanEnd = spanStart + static_cast<std::int64_t>(span.durationMs * 1e6);
+                // The anchor is observed across a synchronize and dated to the midpoint of that bracket, so placement is good to a couple of microseconds rather than exactly. The tolerance is far below the error a wrong anchor produces, which is the whole host delay above.
+                if (spanStart >= loopStart - TRACE_TOLERANCE_NS && spanEnd <= loopEnd + TRACE_TOLERANCE_NS) ++contained;
+                if (span.label == "first") first = &span;
+                if (span.label == "second") second = &span;
+            }
+            // Two kernels on one stream cannot overlap, and the second was launched after the first.
+            if (first && second && second->startNs >= first->startNs) ++ordered;
+        }
+        Check(checked > 0, "device spans carried absolute timestamps");
+        Check(contained == checked, "every GPU span fell inside the host scope that waited for it");
+        Check(ordered == static_cast<int>(worst.size()), "stages on one stream came back in stream order");
+
+        cadence::Config plain;
+        plain.reportStream = nullptr;
+        plain.writeOnExit = false;
+        cadence::Configure(plain);
+        cadence::Reset();
+    }
+
     void TestConcurrentThreadsRecordDeviceWork(float* sink) {
         ResetLibrary(0, 1);
         constexpr int NUM_THREADS_USED = 4;
@@ -398,6 +477,7 @@ int main() {
     TestStreamCaptureIsRefusedRatherThanCorrupted(sink, stream);
     TestFlushInsideCaptureLeavesTheGraphIntact(sink, stream);
     TestCaptureDoesNotLeakEvents(sink, stream);
+    TestTraceSpansNestInsideTheirHostScope(sink, stream);
     TestConcurrentThreadsRecordDeviceWork(sink);
 
     cudaStreamDestroy(other);

@@ -25,6 +25,7 @@
 #include "cadence/detail/report.h"
 #include "cadence/detail/scopes.h"
 #include "cadence/detail/stats.h"
+#include "cadence/detail/trace.h"
 
 namespace cadence {
     // Apply a configuration. Environment variables still win over whatever is set here; see detail/config.h for the list.
@@ -58,8 +59,22 @@ namespace cadence {
 #endif
     }
 
+    // The slowest iterations kept so far, slowest first, each with the stages that ran inside it. An iteration is everything recorded between two flushes. Governed by Config::numWorstIterations.
+    inline std::vector<TraceIteration> WorstIterations() { return detail::Registry::Instance().WorstIterations(); }
+
     // Render the report to an already-open stream. Does not flush first.
     inline void WriteReport(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
+
+    // Write the retained iterations as Chrome Trace Event JSON, which https://ui.perfetto.dev opens directly. Spans carry absolute timestamps only when Config::tracePath was set before the run, since placing GPU work on the host timeline costs an extra query per record at flush.
+    inline void WriteTrace(std::ostream& out) { detail::Registry::Instance().WriteTraceTo(out); }
+
+    // Returns false if the file could not be opened.
+    inline bool WriteTrace(const std::string& path) {
+        std::ofstream out(path);
+        if (!out) return false;
+        WriteTrace(out);
+        return out.good();
+    }
 
     // Returns false if the file could not be opened.
     inline bool WriteReport(const std::string& path) {
@@ -75,8 +90,10 @@ namespace cadence {
         const Config config = GetConfig();
         detail::Registry::Instance().MarkReported();
         if (config.reportStream) WriteReport(*config.reportStream);
-        if (config.outputPath.empty()) return true;
-        return WriteReport(config.outputPath);
+        bool ok = true;
+        if (!config.tracePath.empty()) ok = WriteTrace(config.tracePath);
+        if (config.outputPath.empty()) return ok;
+        return WriteReport(config.outputPath) && ok;
     }
 
 }  // namespace cadence
