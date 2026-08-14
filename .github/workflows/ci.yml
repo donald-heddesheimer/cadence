@@ -109,12 +109,20 @@ jobs:
           cat > consumer/main.cc <<'EOF'
           #include <cadence/cadence.h>
           #include <cassert>
+          #include <chrono>
           int main() {
             cadence::Config config;
-            config.outputPath.clear();
+            config.reportStream = nullptr;
             config.warmupIterations = 0;
             cadence::Configure(config);
-            { CADENCE_SCOPE("installed"); }
+            {
+              CADENCE_SCOPE("installed");
+              // An empty scope can measure zero nanoseconds, which is discarded
+              // as a stalled clock rather than kept as a fast one.
+              const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(2);
+              while (std::chrono::steady_clock::now() < until) {
+              }
+            }
             CADENCE_FLUSH();
             assert(cadence::Snapshot().size() == 1);
             return 0;

@@ -6,8 +6,9 @@ build/
 build-*/
 cmake-build-*/
 
-# Reports written when outputPath is set.
+# Reports and traces written when outputPath or tracePath is set.
 cadence-report.txt
+worst.json
 *.nsys-rep
 *.qdrep
 
