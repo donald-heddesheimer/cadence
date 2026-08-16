@@ -3,6 +3,7 @@
 Time the stages of a CUDA loop from inside your own process. Header-only, C++17.
 
 [![ci](https://github.com/donald-heddesheimer/cadence/actions/workflows/ci.yml/badge.svg)](https://github.com/donald-heddesheimer/cadence/actions/workflows/ci.yml)
+[![coverage](https://codecov.io/gh/donald-heddesheimer/cadence/branch/main/graph/badge.svg)](https://codecov.io/gh/donald-heddesheimer/cadence)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![standard](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](include/cadence)
@@ -197,6 +198,18 @@ ctest --test-dir build --output-on-failure
 Host, disabled-build and self-contained-header tests need no GPU and no CUDA
 toolkit. Device tests build when `nvcc` is found and skip themselves when no
 device answers.
+
+Every push runs gcc and clang across Debug and Release, ASan+UBSan, TSan, a CUDA
+compile job, and an install-and-consume job that builds a separate project
+against `find_package(cadence)` — because a header-only library that does not
+install cleanly is a header-only library nobody can use.
+
+The coverage figure is the host-reachable surface. On a runner with no CUDA
+toolkit `__has_include(<cuda_runtime.h>)` is false and the device paths are
+preprocessed away before gcov sees them, so the number is what the no-GPU tests
+genuinely reach rather than one diluted by lines only a GPU could execute. Those
+lines are compile-checked in the same run and exercised by `cadence_device_tests`
+on real hardware.
 
 ## What it does not do
 
