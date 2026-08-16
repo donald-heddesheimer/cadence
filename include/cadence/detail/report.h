@@ -347,8 +347,10 @@ namespace cadence {
         if (held == nullptr) return;
 
         const std::size_t met = held->count - held->overBudget;
+        // Truncated rather than rounded, so a share only reads 100.0% when every iteration actually held. On a long run one miss in 3157 is 99.968%, which %.1f rounds up -- and a line saying MISSED beside 100.0% is precisely the confusion this whole section exists to prevent.
+        const double metPercent = 100.0 * static_cast<double>(met) / static_cast<double>(held->count);
         char metShare[32];
-        std::snprintf(metShare, sizeof(metShare), "%.1f%%", 100.0 * static_cast<double>(met) / static_cast<double>(held->count));
+        std::snprintf(metShare, sizeof(metShare), "%.1f%%", std::floor(metPercent * 10.0) / 10.0);
         char worstShare[32];
         std::snprintf(worstShare, sizeof(worstShare), "%.0f%%", 100.0 * held->maxMs / held->budgetMs);
 

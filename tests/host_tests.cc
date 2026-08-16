@@ -541,6 +541,25 @@ namespace {
         CHECK(reordered.str() == text);
     }
 
+    // A verdict of MISSED beside a share of 100.0% is the confusion the deadline line exists to prevent, and a long run is exactly where rounding produces it.
+    void TestNearPerfectShareDoesNotRoundToWhole() {
+        std::vector<double> samples(3157, 1.0);
+        samples[0] = 3.0;  // One miss in 3157 is 99.968%, which rounds up.
+        std::vector<cadence::Stats> rows = {MakeRow("loop", cadence::ScopeKind::Host, -1, samples, 2.0)};
+        std::ostringstream out;
+        cadence::detail::WriteBudget(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("3156/3157 iterations inside budget (99.9%)") != std::string::npos);
+        CHECK(text.find("100.0%") == std::string::npos);
+
+        // And a run that genuinely held every iteration still reads as a whole 100.0%.
+        std::vector<cadence::Stats> clean = {MakeRow("loop", cadence::ScopeKind::Host, -1, std::vector<double>(64, 1.0), 2.0)};
+        std::ostringstream perfect;
+        cadence::detail::WriteBudget(perfect, clean, false, cadence::detail::Theme{});
+        CHECK(perfect.str().find("64/64 iterations inside budget (100.0%)") != std::string::npos);
+    }
+
     // Two GPUs run at the same time, so adding their spans together produces a duration no iteration ever took -- one that would grow with every card added while the loop got faster.
     void TestSummaryTotalsPerDevice() {
         std::vector<cadence::Stats> rows = {
@@ -825,6 +844,7 @@ int main() {
         {"device column appears only with several devices", TestDeviceColumnAppearsOnlyWithSeveralDevices},
         {"budget line names the worst device", TestBudgetLineNamesTheWorstDevice},
         {"summary totals per device", TestSummaryTotalsPerDevice},
+        {"near-perfect share does not round to whole", TestNearPerfectShareDoesNotRoundToWhole},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},
