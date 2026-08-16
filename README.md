@@ -79,7 +79,7 @@ the bad one.
 | Nsight Systems | what the whole system did over a few seconds | launch under `nsys`, open the capture | one-off investigation |
 | Nsight Compute | why one kernel is slow, to hardware counters | `ncu`, which replays each kernel | no, orders of magnitude slower |
 | nvbench | how a kernel scales across a parameter sweep | a separate benchmark binary | no, measures kernels not your app |
-| Hand-rolled `cudaEvent` | whatever you wired up | you write it | usually wrong; the obvious version synchronizes per kernel |
+| Hand-rolled `cudaEvent` | whatever you wired up | you write it | the obvious version blocks per kernel: 6.5µs a scope against cadence's 3.4µs |
 
 cadence complements the Nsight tools. Use it to find *when and where* you got
 slow, then `nsys` or `ncu` for *why*. Every scope also emits an NVTX range, so
@@ -175,6 +175,14 @@ is optional because the failures they prevent are silent.
 
 Wrap stages, not individual small kernels. Below roughly 50 µs of GPU work per
 scope the instrumentation becomes a visible fraction of the result.
+
+Against the version most people write by hand — record either side of the launch,
+then `cudaEventSynchronize` and read the elapsed time out — cadence costs about
+half as much per scope and takes noticeably less out of the loop: over 50,000
+launches the hand-rolled version runs 3.7x the uninstrumented wall clock against
+cadence's 2.7x. The gap widens over real work rather than closing, because
+cadence's records go out while the GPU is already busy and a blocking read gives
+up that overlap by construction.
 [docs/overhead.md](docs/overhead.md) has the measurements behind this.
 
 ## Build and test
