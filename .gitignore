@@ -6,6 +6,7 @@ docs/*
 !docs/overhead.md
 !docs/report.svg
 !docs/render_report_svg.py
+!docs/timeline.png
 
 build/
 build-*/
