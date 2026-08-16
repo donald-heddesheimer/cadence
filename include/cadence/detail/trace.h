@@ -32,7 +32,7 @@ namespace cadence {
     // Everything recorded between two flushes, which is one pass of the instrumented loop.
     struct TraceIteration {
         std::uint64_t index = 0;  // Which flush produced it, counted from the first.
-        double spanMs = 0.0;      // What the iteration is ranked by; see IterationSpanMs.
+        double spanMs = 0.0;      // What the iteration is ranked by: the loop scope, or the GPU work when that ran longer. See IterationSpanMs.
         std::vector<TraceSpan> spans;
     };
 
@@ -55,8 +55,10 @@ namespace cadence {
 
     // How long an iteration took, for ranking.
     //
-    // A CADENCE_SCOPE wrapped around the loop body is the iteration, so the longest pure host span is the iteration's own duration and needs no reconstruction from parts. Only when nothing recorded a host span does this fall back to adding up the GPU work, which is not the same quantity -- concurrent streams make it an overestimate -- but it does rank a device-only run in roughly the right order, which is all a ranking needs.
-    inline double IterationSpanMs(const std::vector<IterationSpan>& spans, bool sawHostScope) {
+    // A CADENCE_SCOPE wrapped around the loop body is the iteration, so the longest pure host span is normally the iteration's own duration and needs no reconstruction from parts. When nothing recorded a host span, adding up the GPU work ranks a device-only run in roughly the right order, which is all a ranking needs, though concurrent streams make it an overestimate.
+    //
+    // Taking whichever is larger rather than preferring the host span is what keeps this honest when the host scope does not enclose the work it launched. A loop that queues asynchronous work and synchronizes somewhere else has a host span that returns in microseconds against milliseconds of GPU time -- llama.cpp's decode is 8us of host per 3.9ms graph -- and ranking those iterations by the host span ranks them by host jitter. The run that found this picked an iteration for an 18.9us host span with an entirely ordinary GPU pass in it while the slowest GPU iteration in the run never appeared. Where the host scope does enclose the work, it is the larger of the two by construction and nothing changes.
+    inline double IterationSpanMs(const std::vector<IterationSpan>& spans) {
         double longestHost = 0.0;
         double deviceTotal = 0.0;
         for (const IterationSpan& span : spans) {
@@ -66,7 +68,7 @@ namespace cadence {
                 deviceTotal += span.durationMs;
             }
         }
-        return sawHostScope ? longestHost : deviceTotal;
+        return longestHost > deviceTotal ? longestHost : deviceTotal;
     }
 
     // JSON string escaping, for label text that came from the caller.
