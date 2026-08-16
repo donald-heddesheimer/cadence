@@ -464,7 +464,10 @@ namespace cadence {
 
 #if CADENCE_HAS_CUDA
         // One anchor per device that recorded anything in this flush. Called after every stop event has been waited on, so the streams are drained and the anchor completes almost immediately; the remaining error is half the latency of the synchronize returning, which is why the host clock is read on both sides of it and the midpoint taken.
+        //
+        // Runs before samplesMutex_ is taken and holds a lock of its own, because Flush() is callable from more than one thread and the anchor events are registry-wide: without it two concurrent flushes would resize the same vector under each other and create two events into one slot.
         std::vector<TraceAnchor> RecordTraceAnchors(const std::vector<std::vector<DeviceRecord>>& batches) {
+            std::lock_guard<std::mutex> lock(anchorMutex_);
             std::vector<cudaStream_t> streams;
             std::vector<bool> present;
             for (const std::vector<DeviceRecord>& batch : batches) {
@@ -580,6 +583,7 @@ namespace cadence {
         std::vector<IterationSpan> iterationSpans_;  // Reused every flush so the steady state does not allocate.
 #if CADENCE_HAS_CUDA
         std::vector<cudaStream_t> lanes_;
+        mutable std::mutex anchorMutex_;         // Guards anchorEvents_ only, and is never held alongside another lock.
         std::vector<cudaEvent_t> anchorEvents_;  // One per device, reused by every flush that builds a trace.
 #endif
 
