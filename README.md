@@ -188,6 +188,13 @@ cadence's records go out while the GPU is already busy and a blocking read gives
 up that overlap by construction.
 [docs/overhead.md](docs/overhead.md) has the measurements behind this.
 
+That figure was cross-checked outside its own benchmark.
+[docs/case-study.md](docs/case-study.md) puts cadence on llama.cpp's CUDA
+backend, where counting scopes against llama-bench's own throughput puts the cost
+at 3044 and 3227 ns/scope in two configurations — and where wrapping every graph
+node instead of the graph costs 20% of tokens per second, which is the same
+advice as the paragraph above with a price on it.
+
 ## Build and test
 
 ```sh
