@@ -113,7 +113,7 @@ target_link_libraries(my_app PRIVATE cadence::cadence)
 include(FetchContent)                                  # fetched
 FetchContent_Declare(cadence
   GIT_REPOSITORY https://github.com/donald-heddesheimer/cadence.git
-  GIT_TAG        main)
+  GIT_TAG        v0.2.0)
 FetchContent_MakeAvailable(cadence)
 target_link_libraries(my_app PRIVATE cadence::cadence)
 ```
