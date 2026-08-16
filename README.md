@@ -63,10 +63,13 @@ Event JSON, which [ui.perfetto.dev](https://ui.perfetto.dev) opens directly:
 cfg.tracePath = "worst.json";   // or: CADENCE_TRACE=worst.json ./app
 ```
 
-One lane for the CPU, one per CUDA stream, on a shared clock. A launch sitting
-well ahead of the kernel it queued is a visible gap rather than something you
-infer from two columns. Only the worst iterations are exported; a trace of a
-whole run is enormous and nobody scrolls a million spans looking for the bad one.
+![One iteration on the Perfetto timeline. On the host lane both kernel launches have returned within the first 10µs; on the device lane saxpy runs until 41µs and scale does not begin until 43µs, leaving a visible gap between a launch and the work it queued](docs/timeline.png)
+
+One lane for the CPU, one per CUDA stream, on a shared clock. Above, `scale` was
+queued at 10µs and did not start on the GPU until 43µs — a gap you would never
+infer from two columns of durations. Only the worst iterations are exported; a
+trace of a whole run is enormous and nobody scrolls a million spans looking for
+the bad one.
 
 ## Where it fits
 
