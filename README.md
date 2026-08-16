@@ -96,6 +96,8 @@ the same instrumentation shows up on the Nsight timeline for free.
   honoured; a redirected run and the `outputPath` copy stay clean text.
 - **CPU and GPU through one API.** Host timers compile in translation units with
   no CUDA in them.
+- **A row per GPU.** A process driving several cards gets one row each and a `dev`
+  column to tell them apart, which appears only when there is more than one.
 - **Compiles to nothing.** `-DCADENCE_DISABLE` removes every macro without
   leaving a runtime branch behind.
 - **Provenance in the output.** Device, clock ceilings, warmup, sampling rate and
@@ -199,9 +201,12 @@ event permanently unreadable and, if a flush lands before the capture closes,
 invalidates the capture itself. Scopes on a capturing stream therefore record
 nothing and the report says how many stood down. Wrap the graph launch instead.
 
-Events are pooled per device, so a process driving several GPUs measures each
-correctly, but the report lists labels rather than devices: two GPUs running the
-same label share one row.
+Per-device rows are implemented and tested, but only against one GPU: no machine
+here has two. The storage keying, the `dev` column, the deadline line's choice of
+which card to report, and the summary's refusal to add two cards' concurrent
+spans into one total are each covered by a test verified to fail without the
+change. None of that is the same as having watched it run on two cards, and it is
+not claimed to be.
 
 ## License
 
