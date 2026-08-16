@@ -115,14 +115,17 @@ namespace cadence {
             first = false;
         };
 
+        // Lane numbers are shifted by one on the way out, because thread id 0 is not a thread. Perfetto inherits the kernel's convention where tid 0 is the idle task, and a track claiming that id is folded into another rather than drawn on its own row: the host spans then land in a device stream's track and nest inside it by time containment, which turns the one thing a timeline is for -- a launch sitting visibly ahead of the kernel it queued -- into a stack of boxes that looks like a call tree. Host becomes tid 1, stream N becomes tid N+1.
+        constexpr int TID_OFFSET = 1;
+
         // Metadata naming the lanes. Without these a viewer labels every row by a bare numeric id.
         separator();
         out << "    {\"ph\":\"M\",\"pid\":1,\"name\":\"process_name\",\"args\":{\"name\":\"cadence\"}}";
         separator();
-        out << "    {\"ph\":\"M\",\"pid\":1,\"tid\":0,\"name\":\"thread_name\",\"args\":{\"name\":\"host (CPU)\"}}";
+        out << "    {\"ph\":\"M\",\"pid\":1,\"tid\":" << TID_OFFSET << ",\"name\":\"thread_name\",\"args\":{\"name\":\"host (CPU)\"}}";
         for (int lane = 1; lane <= maxLane; ++lane) {
             separator();
-            out << "    {\"ph\":\"M\",\"pid\":1,\"tid\":" << lane
+            out << "    {\"ph\":\"M\",\"pid\":1,\"tid\":" << lane + TID_OFFSET
                 << ",\"name\":\"thread_name\",\"args\":{\"name\":\"device stream " << lane << "\"}}";
         }
 
@@ -133,7 +136,7 @@ namespace cadence {
                 const double durationUs = span.durationMs * 1000.0;
                 char numbers[128];
                 std::snprintf(numbers, sizeof(numbers), "\"ts\":%.3f,\"dur\":%.3f", startUs, durationUs);
-                out << "    {\"ph\":\"X\",\"pid\":1,\"tid\":" << span.lane
+                out << "    {\"ph\":\"X\",\"pid\":1,\"tid\":" << span.lane + TID_OFFSET
                     << ",\"name\":\"" << EscapeJson(span.label) << "\""
                     << ",\"cat\":\"" << ScopeKindName(span.kind) << "\","
                     << numbers

@@ -396,6 +396,29 @@ namespace {
         CHECK(off.str().find("slowest iterations") == std::string::npos);
     }
 
+    // Every lane has to land on its own row in a viewer, which is the entire reason to write a trace rather than another table. Thread id 0 is the idle task by the convention Perfetto inherits from the kernel, and a track claiming it gets folded into a neighbour instead of drawn: the host spans then nest inside a device stream's track and the launch-ahead-of-kernel gap stops being visible. Nothing about the file looks wrong when this happens, so it is pinned here rather than left to be noticed in a screenshot.
+    void TestTraceLanesAreDistinctThreads() {
+        cadence::TraceIteration iteration;
+        iteration.index = 0;
+        iteration.spanMs = 0.05;
+        iteration.spans.push_back(cadence::TraceSpan{"loop", cadence::ScopeKind::Host, 0.05, 1000, 0});
+        iteration.spans.push_back(cadence::TraceSpan{"saxpy", cadence::ScopeKind::Device, 0.04, 2000, 1});
+        iteration.spans.push_back(cadence::TraceSpan{"scale", cadence::ScopeKind::Device, 0.02, 3000, 2});
+
+        std::ostringstream out;
+        cadence::detail::WriteTraceJson(out, {iteration});
+        const std::string json = out.str();
+
+        CHECK(json.find("\"tid\":0") == std::string::npos);
+        // Distinct ids, and the metadata naming each lane has to agree with the spans that sit on it.
+        CHECK(json.find("\"tid\":1,\"name\":\"thread_name\",\"args\":{\"name\":\"host (CPU)\"}") != std::string::npos);
+        CHECK(json.find("\"tid\":2,\"name\":\"thread_name\",\"args\":{\"name\":\"device stream 1\"}") != std::string::npos);
+        CHECK(json.find("\"tid\":3,\"name\":\"thread_name\",\"args\":{\"name\":\"device stream 2\"}") != std::string::npos);
+        CHECK(json.find("\"tid\":1,\"name\":\"loop\"") != std::string::npos);
+        CHECK(json.find("\"tid\":2,\"name\":\"saxpy\"") != std::string::npos);
+        CHECK(json.find("\"tid\":3,\"name\":\"scale\"") != std::string::npos);
+    }
+
     // The trace is the same retained iterations in a format a timeline viewer opens. Exporting a whole run would be enormous and useless; exporting the passes that actually missed is neither.
     void TestTraceJsonShape() {
         cadence::Config config;
@@ -691,6 +714,7 @@ int main() {
         {"bounded retention keeps exact aggregates", TestBoundedRetentionKeepsExactAggregates},
         {"retention cap bounds memory", TestRetentionCapBoundsMemory},
         {"worst iterations retained", TestWorstIterationsAreRetained},
+        {"trace lanes are distinct threads", TestTraceLanesAreDistinctThreads},
         {"trace json shape", TestTraceJsonShape},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
