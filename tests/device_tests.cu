@@ -421,6 +421,42 @@ namespace {
         cadence::Reset();
     }
 
+    // Rows must carry the GPU that produced them. Only the single-device half of that is checkable here -- this machine has one card -- but it is the half that every run exercises: an attribution that silently came back -1 would make the report's device column vanish on the machines that need it.
+    void TestDeviceRowsCarryTheirDevice(float* sink, cudaStream_t stream) {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        int current = -1;
+        cudaGetDevice(&current);
+        for (int i = 0; i < 4; ++i) {
+            {
+                CADENCE_KERNEL("attributed", stream);
+                Spin<<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(sink, SPIN_UNIT);
+            }
+            BurnHostMicroseconds(5);
+        }
+        cudaStreamSynchronize(stream);
+        cadence::Flush();
+
+        const auto snapshot = cadence::Snapshot();
+        std::size_t deviceRows = 0;
+        bool attributed = true;
+        for (const cadence::Stats& row : snapshot) {
+            if (row.label != "attributed") continue;
+            ++deviceRows;
+            // Both halves of the label -- the GPU span and the CPU-issue span beside it -- belong to the card the work went to.
+            if (row.device != current) attributed = false;
+        }
+        Check(deviceRows == 2, "one GPU row and one issue row for the label");
+        Check(attributed, "both rows name the device that ran the work");
+
+        // One card, so the column that tells cards apart must not appear.
+        Check(!cadence::detail::HasMultipleDevices(snapshot), "a single-GPU report hides the device column");
+    }
+
     void TestConcurrentThreadsRecordDeviceWork(float* sink) {
         ResetLibrary(0, 1);
         constexpr int NUM_THREADS_USED = 4;
@@ -478,6 +514,7 @@ int main() {
     TestFlushInsideCaptureLeavesTheGraphIntact(sink, stream);
     TestCaptureDoesNotLeakEvents(sink, stream);
     TestTraceSpansNestInsideTheirHostScope(sink, stream);
+    TestDeviceRowsCarryTheirDevice(sink, stream);
     TestConcurrentThreadsRecordDeviceWork(sink);
 
     cudaStreamDestroy(other);

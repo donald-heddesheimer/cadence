@@ -580,6 +580,130 @@ namespace {
         CHECK(balanced && depth == 0);
     }
 
+    // One row of a report, built by hand. The recording path that keys samples by device is compiled out of a host-only build, so the presentation half is driven from synthesized statistics instead -- which is the half a second GPU changes anyway.
+    cadence::Stats MakeRow(const char* label, cadence::ScopeKind kind, int device, const std::vector<double>& samples, double budgetMs = 0.0) {
+        cadence::Stats row = cadence::detail::ComputeStats(label, kind, samples, 0, budgetMs);
+        row.device = device;
+        return row;
+    }
+
+    std::string RenderTable(const std::vector<cadence::Stats>& rows) {
+        std::ostringstream out;
+        cadence::detail::WriteStatsTable(out, rows, false, cadence::detail::Theme{});
+        return out.str();
+    }
+
+    // Two GPUs running the same label must not share a row. Averaging them answers a question nobody asked: the reason to look at two cards is that one of them is slower.
+    void TestDeviceSamplesKeyByDevice() {
+        cadence::detail::LabelSamples samples;
+        cadence::detail::SlotFor(samples, 7, 1).gpu.Add(2.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 0).gpu.Add(1.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 1).gpu.Add(4.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 0).issue.Add(0.5, 0.0, 0);
+
+        // Two slots, not three and not one, and ordered by device id however they arrived.
+        CHECK(samples.devices.size() == 2);
+        CHECK(samples.devices[0].device == 0);
+        CHECK(samples.devices[1].device == 1);
+        CHECK(samples.devices[0].gpu.count == 1);
+        CHECK(samples.devices[1].gpu.count == 2);
+        CHECK_NEAR(samples.devices[0].gpu.mean, 1.0, 1e-9);
+        CHECK_NEAR(samples.devices[1].gpu.mean, 3.0, 1e-9);
+        // The issue side is keyed the same way and stays on its own device.
+        CHECK(samples.devices[0].issue.count == 1);
+        CHECK(samples.devices[1].issue.count == 0);
+        // Distinct seeds, so two cards do not thin their reservoirs in lockstep.
+        CHECK(samples.devices[0].gpu.rngState != samples.devices[1].gpu.rngState);
+    }
+
+    // The device column costs a reader nothing to ignore but everything to misread, so it appears only when there is a second GPU to tell apart.
+    void TestDeviceColumnAppearsOnlyWithSeveralDevices() {
+        const std::vector<double> fast = {1.0, 1.1, 1.2};
+        const std::vector<double> slow = {4.0, 4.1, 4.2};
+
+        std::vector<cadence::Stats> single = {
+            MakeRow("saxpy", cadence::ScopeKind::Device, 0, fast),
+            MakeRow("iteration", cadence::ScopeKind::Host, -1, slow),
+        };
+        const std::string one = RenderTable(single);
+        CHECK(one.find(" dev ") == std::string::npos);
+
+        std::vector<cadence::Stats> several = single;
+        several.push_back(MakeRow("saxpy", cadence::ScopeKind::Device, 1, slow));
+        const std::string two = RenderTable(several);
+        CHECK(two.find("scope   dev  n") != std::string::npos);
+        CHECK(two.find("saxpy      device    0  3") != std::string::npos);
+        CHECK(two.find("saxpy      device    1  3") != std::string::npos);
+        // A plain host span belongs to no GPU, so its cell stays blank rather than claiming device 0.
+        CHECK(two.find("iteration  host         3") != std::string::npos);
+    }
+
+    // With one label on several GPUs every one of its rows carries the deadline, and there is one line to spend. A verdict that reads "met" while another card missed is the most misleading thing this report could print.
+    void TestBudgetLineNamesTheWorstDevice() {
+        std::vector<cadence::Stats> rows = {
+            MakeRow("infer", cadence::ScopeKind::Device, 0, {1.0, 1.1, 1.2}, 2.0),
+            MakeRow("infer", cadence::ScopeKind::Device, 1, {1.0, 3.0, 4.0}, 2.0),
+        };
+        std::ostringstream out;
+        cadence::detail::WriteBudget(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("on device 1, the worst of 2") != std::string::npos);
+        CHECK(text.find("1/3 iterations inside budget") != std::string::npos);
+
+        // Sorting the misses later must not change the verdict; the row is chosen, not taken last.
+        std::swap(rows[0], rows[1]);
+        std::ostringstream reordered;
+        cadence::detail::WriteBudget(reordered, rows, false, cadence::detail::Theme{});
+        CHECK(reordered.str() == text);
+    }
+
+    // A verdict of MISSED beside a share of 100.0% is the confusion the deadline line exists to prevent, and a long run is exactly where rounding produces it.
+    void TestNearPerfectShareDoesNotRoundToWhole() {
+        std::vector<double> samples(3157, 1.0);
+        samples[0] = 3.0;  // One miss in 3157 is 99.968%, which rounds up.
+        std::vector<cadence::Stats> rows = {MakeRow("loop", cadence::ScopeKind::Host, -1, samples, 2.0)};
+        std::ostringstream out;
+        cadence::detail::WriteBudget(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("3156/3157 iterations inside budget (99.9%)") != std::string::npos);
+        CHECK(text.find("100.0%") == std::string::npos);
+
+        // And a run that genuinely held every iteration still reads as a whole 100.0%.
+        std::vector<cadence::Stats> clean = {MakeRow("loop", cadence::ScopeKind::Host, -1, std::vector<double>(64, 1.0), 2.0)};
+        std::ostringstream perfect;
+        cadence::detail::WriteBudget(perfect, clean, false, cadence::detail::Theme{});
+        CHECK(perfect.str().find("64/64 iterations inside budget (100.0%)") != std::string::npos);
+    }
+
+    // Two GPUs run at the same time, so adding their spans together produces a duration no iteration ever took -- one that would grow with every card added while the loop got faster.
+    void TestSummaryTotalsPerDevice() {
+        std::vector<cadence::Stats> rows = {
+            MakeRow("saxpy", cadence::ScopeKind::Device, 0, {1.0, 1.0, 1.0}),
+            MakeRow("scale", cadence::ScopeKind::Device, 0, {2.0, 2.0, 2.0}),
+            MakeRow("saxpy", cadence::ScopeKind::Device, 1, {4.0, 4.0, 4.0}),
+            MakeRow("iteration", cadence::ScopeKind::Host, -1, {20.0, 20.0, 20.0}),
+        };
+        std::ostringstream out;
+        cadence::detail::WriteSummary(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("3.00ms across 2 label(s) on device 0") != std::string::npos);
+        CHECK(text.find("4.00ms across 1 label(s) on device 1") != std::string::npos);
+        CHECK(text.find("7.00ms") == std::string::npos);
+        // The remainder is launch and synchronization only while there is one GPU to subtract, so with several the line is withheld rather than guessed at.
+        CHECK(text.find("launch and synchronization") == std::string::npos);
+
+        // With a single device it reads exactly as it always did.
+        rows.erase(rows.begin() + 2);
+        std::ostringstream one;
+        cadence::detail::WriteSummary(one, rows, false, cadence::detail::Theme{});
+        const std::string single = one.str();
+        CHECK(single.find("3.00ms across 2 label(s)") != std::string::npos);
+        CHECK(single.find("on device") == std::string::npos);
+        CHECK(single.find("launch and synchronization") != std::string::npos);
+    }
+
     void TestBudgetCountsMisses() {
         cadence::Config config;
         config.warmupIterations = 0;
@@ -837,6 +961,11 @@ int main() {
         {"worst iterations rank by the longer span", TestWorstIterationsRankByTheLongerOfHostAndDevice},
         {"trace lanes are distinct threads", TestTraceLanesAreDistinctThreads},
         {"trace json shape", TestTraceJsonShape},
+        {"device samples key by device", TestDeviceSamplesKeyByDevice},
+        {"device column appears only with several devices", TestDeviceColumnAppearsOnlyWithSeveralDevices},
+        {"budget line names the worst device", TestBudgetLineNamesTheWorstDevice},
+        {"summary totals per device", TestSummaryTotalsPerDevice},
+        {"near-perfect share does not round to whole", TestNearPerfectShareDoesNotRoundToWhole},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},

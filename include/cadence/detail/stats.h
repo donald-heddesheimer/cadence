@@ -25,6 +25,8 @@ namespace cadence {
     struct Stats {
         std::string label;
         ScopeKind kind = ScopeKind::Device;
+        // Which GPU produced this row, or -1 for a row that belongs to no device: a plain CADENCE_SCOPE, or statistics computed from samples cadence did not gather. A process driving several GPUs gets one row per device per label, because the reason to look at two cards is that one of them is slower and an average of the two says nothing about either.
+        int device = -1;
         std::size_t count = 0;      // Samples kept, i.e. after warmup discard.
         std::size_t discarded = 0;  // Samples dropped as warmup.
         double meanMs = 0.0;
