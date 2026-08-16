@@ -188,6 +188,12 @@ Host, disabled-build and self-contained-header tests need no GPU and no CUDA
 toolkit. Device tests build when `nvcc` is found and skip themselves when no
 device answers.
 
+`examples/` has a standalone CUDA loop, and a [ROS 2 node](examples/ros2) whose
+timer callback is held to its own period — so the report's verdict is "did this
+callback hold its rate", which is the question a robotics developer actually has.
+That package builds with colcon and sits outside this build and outside CI,
+because a header-only library should not make every consumer care about ROS 2.
+
 ## What it does not do
 
 Elapsed time only, through the CUDA runtime API: hardware counters are `ncu`'s
