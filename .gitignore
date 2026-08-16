@@ -1,6 +1,9 @@
 # Working notes that are not part of the published library.
 dev/
+
+# Working notes stay out; the published measurement writeup is tracked.
 docs/*
+!docs/overhead.md
 
 build/
 build-*/
