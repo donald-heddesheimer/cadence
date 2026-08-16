@@ -50,20 +50,6 @@ Timing GPU work usually means synchronizing to read a stopwatch, which changes
 the thing being timed. cadence records events and walks away; the numbers are
 resolved later, at a boundary where you were already going to synchronize.
 
-```mermaid
-flowchart LR
-  subgraph loop["your loop — no synchronization added"]
-    direction LR
-    A["record start"] --> B["your kernel<br/>launches as usual"] --> C["record stop,<br/>buffer the pair"]
-  end
-  C -.->|"next scope"| A
-  C ==> D
-  subgraph flush["CADENCE_FLUSH — once per iteration"]
-    direction LR
-    D["cudaStreamSynchronize<br/>you were doing this anyway"] --> E["read every<br/>buffered pair"] --> F["fold into<br/>bounded statistics"]
-  end
-```
-
 Buffers are thread-local, so threads do not contend; statistics are folded in
 with Welford's method and a sample reservoir, so a loop running for a week costs
 the same memory as one running for a minute.
