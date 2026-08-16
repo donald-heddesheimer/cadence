@@ -30,32 +30,7 @@ while (running) {
 CADENCE_REPORT();
 ```
 
-```
-cadence report
-  device    NVIDIA RTX A4000 (sm_86), sm clock <= 1560 MHz, mem clock <= 7001 MHz
-  clocks    not locked by cadence; run `nvidia-smi -lgc 1560` before comparing runs
-  warmup    10 iteration(s) discarded per label
-
-  label      scope     n    mean     p50     p95     max  jitter  distribution
-  ────────────────────────────────────────────────────────────────────────────
-  iteration  host    190  68.9µs  68.7µs  70.2µs  83.2µs  17.8µs  ▂▅█▂  ▂ ▂  ▂
-  saxpy      device  190  37.4µs  37.7µs  38.1µs  38.9µs  2.82µs  ▂ ▂█▂ ▂█▂ ▂▂
-  saxpy      host    190  5.24µs  5.18µs  5.66µs  7.96µs  5.32µs  ▂    █▄▂▂▂▂▂
-  scale      device  190  24.3µs  24.6µs  25.6µs  25.6µs  3.07µs  ▂   ▆▂  █  ▂
-  scale      host    190  5.22µs  5.17µs  5.69µs  8.30µs  5.67µs  ▂  ▂▄█▃▂▂ ▂▂
-
-  deadline  80.0µs on iteration (host)
-  MISSED    188/190 iterations inside budget (98.9%); worst 83.2µs at 104% of budget
-            [███████████████████████████████████░░░░░]  p95 70.2µs at 88%
-
-  slowest iterations
-    #129    83.2µs  saxpy 37.9µs · scale 24.6µs
-    #77     83.1µs  saxpy 37.9µs · scale 24.6µs
-    #25     77.8µs  saxpy 36.9µs · scale 23.8µs
-
-  device    61.7µs across 2 label(s)
-  iteration  68.9µs, of which 89.5% is GPU work; 7.21µs is launch and synchronization
-```
+![cadence report: a table of per-label latency distributions with a histogram column, a deadline verdict reading MISSED on 185 of 190 iterations, and a breakdown of the three slowest iterations by stage](docs/report.svg)
 
 Reading it:
 
@@ -68,6 +43,30 @@ Reading it:
   loop that blows its budget once in fifty has a healthy mean and a real problem.
 - **The slowest iterations** are kept whole, so you see which passes missed and
   where their time went, not just that some did.
+
+## How it stays out of the way
+
+Timing GPU work usually means synchronizing to read a stopwatch, which changes
+the thing being timed. cadence records events and walks away; the numbers are
+resolved later, at a boundary where you were already going to synchronize.
+
+```mermaid
+flowchart LR
+  subgraph loop["your loop — no synchronization added"]
+    direction LR
+    A["record start"] --> B["your kernel<br/>launches as usual"] --> C["record stop,<br/>buffer the pair"]
+  end
+  C -.->|"next scope"| A
+  C ==> D
+  subgraph flush["CADENCE_FLUSH — once per iteration"]
+    direction LR
+    D["cudaStreamSynchronize<br/>you were doing this anyway"] --> E["read every<br/>buffered pair"] --> F["fold into<br/>bounded statistics"]
+  end
+```
+
+Buffers are thread-local, so threads do not contend; statistics are folded in
+with Welford's method and a sample reservoir, so a loop running for a week costs
+the same memory as one running for a minute.
 
 ## Timelines
 
@@ -99,13 +98,13 @@ the same instrumentation shows up on the Nsight timeline for free.
 
 ## Features
 
-- **No synchronization on the hot path.** Event pairs are buffered and resolved
-  at `CADENCE_FLUSH()`, at a boundary where you were going to synchronize anyway.
 - **Distributions, not averages.** mean, min, p50, p95, max, stddev, jitter.
-- **Bounded memory.** A loop left running for a week costs the same as one
-  running for a minute. Count, mean, stddev, min, max and the deadline verdict
-  stay exact past the cap; only percentiles and the histogram become estimates,
-  drawn from a uniform sample of the whole run rather than a recent window.
+- **Exact where it counts.** Past the retention cap, count, mean, stddev, min,
+  max and the deadline verdict stay exact; only percentiles and the histogram
+  become estimates, drawn from a uniform sample of the whole run rather than a
+  recent window.
+- **Colour when a terminal is watching.** Auto-detected, and `NO_COLOR` is
+  honoured; a redirected run and the `outputPath` copy stay clean text.
 - **CPU and GPU through one API.** Host timers compile in translation units with
   no CUDA in them.
 - **Compiles to nothing.** `-DCADENCE_DISABLE` removes every macro without
@@ -156,6 +155,7 @@ cfg.maxSamplesPerLabel = 32768; // retained per row; 0 keeps every observation
 cfg.outputPath = "run.txt";     // also write the report here
 cfg.reportStream = &std::cerr;  // where it prints; nullptr suppresses printing
 cfg.unicodeOutput = false;      // ASCII table for terminals that mangle UTF-8
+cfg.colorOutput = cadence::ColorMode::Auto;  // Auto colours a terminal and nothing else
 cadence::Configure(cfg);
 
 std::vector<cadence::Stats> rows = cadence::Snapshot();   // assert on these in tests

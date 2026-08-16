@@ -12,6 +12,9 @@ namespace cadence {
     // Observations retained per label per row before the reservoir starts replacing rather than appending. A library meant to be left in a production loop cannot keep every observation: at 100 Hz across five labels a day-long run accumulates roughly 43 million doubles, and a profiler that grows without bound until the process is killed is not one you leave switched on. 32768 caps a row at 256 KB while still estimating a p95 to well within a percent.
     inline constexpr std::size_t NUM_SAMPLES_RETAINED = 32768;
 
+    // Whether the report is printed with ANSI colour. Auto colours only when the report is going to a terminal, which keeps a redirected run and the outputPath copy as clean text; escape codes in a log file are worse than no colour at all.
+    enum class ColorMode { Auto, Always, Never };
+
     struct Config {
         // Iterations discarded per label before statistics accumulate. The first launches pay for context creation, JIT, and library autotuning (cuBLAS/cuDNN), so counting them poisons the mean and the minimum.
         unsigned warmupIterations = 3;
@@ -21,6 +24,9 @@ namespace cadence {
 
         // Where the report is printed. stdout by default, the way a benchmark tool prints its results; point it at std::cerr to keep it out of a pipeline, or at nullptr to suppress printing and rely on outputPath alone.
         std::ostream* reportStream = &std::cout;
+
+        // Colour in the report. The default colours a terminal and nothing else; NO_COLOR in the environment turns it off everywhere.
+        ColorMode colorOutput = ColorMode::Auto;
 
         // Box-drawing characters and block glyphs in the report. Turn it off for a terminal or a log collector that mangles UTF-8; the table then renders in pure ASCII.
         bool unicodeOutput = true;
@@ -92,7 +98,7 @@ namespace cadence {
         return fallback;
     }
 
-    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES, CADENCE_WORST, CADENCE_TRACE.
+    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_COLOR, NO_COLOR, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES, CADENCE_WORST, CADENCE_TRACE.
     inline void ApplyEnvironmentOverrides(Config& config) {
         if (const char* warmup = EnvOrNull("CADENCE_WARMUP")) {
             config.warmupIterations = static_cast<unsigned>(std::strtoul(warmup, nullptr, 10));
@@ -116,6 +122,15 @@ namespace cadence {
         config.nvtxEnabled = ParseBool(EnvOrNull("CADENCE_NVTX"), config.nvtxEnabled);
         config.enabled = ParseBool(EnvOrNull("CADENCE_ENABLE"), config.enabled);
         config.unicodeOutput = ParseBool(EnvOrNull("CADENCE_UNICODE"), config.unicodeOutput);
+        // NO_COLOR is read first and CADENCE_COLOR second, so the library-specific setting can still turn colour back on. Honouring the convention at all is the point: a user who set NO_COLOR has already said what they want of every tool they run.
+        if (EnvOrNull("NO_COLOR")) config.colorOutput = ColorMode::Never;
+        if (const char* color = EnvOrNull("CADENCE_COLOR")) {
+            if (std::string(color) == "auto") {
+                config.colorOutput = ColorMode::Auto;
+            } else {
+                config.colorOutput = ParseBool(color, true) ? ColorMode::Always : ColorMode::Never;
+            }
+        }
         if (const char* budget = EnvOrNull("CADENCE_BUDGET_MS")) {
             config.budgetMs = std::strtod(budget, nullptr);
         }

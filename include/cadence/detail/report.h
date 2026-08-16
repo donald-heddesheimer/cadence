@@ -10,9 +10,16 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 #include <ostream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "cadence/detail/config.h"
 #include "cadence/detail/platform.h"
@@ -31,6 +38,46 @@ namespace cadence {
     };
 
     namespace detail {
+
+    // ANSI escapes, or empty strings when this report is not going anywhere that understands them. Carried as a value passed down the writers rather than read from a global, because a run that prints to the console and also writes outputPath renders the same report twice and only one of the two wants escape codes in it.
+    //
+    // Nothing here may reach DisplayWidth() or PadTo(): an escape sequence is ASCII bytes that occupy no cells, so a coloured string measures wider than it draws and every column after it shifts. Colour is applied to whole cells after they are padded, or to the last thing on a line.
+    struct Theme {
+        const char* title = "";
+        const char* key = "";     // Provenance keys, headings, rules: present but not competing with the numbers.
+        const char* good = "";
+        const char* bad = "";
+        const char* warn = "";
+        const char* accent = "";
+        const char* reset = "";
+    };
+
+    inline bool StreamIsTerminal(const std::ostream& out) {
+        // Only the two standard streams can be checked. An ostream gives no way back to a file descriptor, so anything else -- a file, a stringstream -- is treated as not a terminal, which is the safe answer for both.
+#if defined(_WIN32)
+        if (&out == &std::cout) return _isatty(1) != 0;
+        if (&out == &std::cerr) return _isatty(2) != 0;
+#else
+        if (&out == &std::cout) return ::isatty(1) != 0;
+        if (&out == &std::cerr) return ::isatty(2) != 0;
+#endif
+        return false;
+    }
+
+    inline Theme SelectTheme(const std::ostream& out, ColorMode mode) {
+        const bool colored = mode == ColorMode::Always || (mode == ColorMode::Auto && StreamIsTerminal(out));
+        if (!colored) return Theme{};
+        // Basic ANSI only. The 256-colour and truecolour forms buy a nicer palette in exchange for terminals that render them as garbage, which is a bad trade for output whose whole purpose is being readable.
+        Theme theme;
+        theme.title = "\033[1m";
+        theme.key = "\033[2m";
+        theme.good = "\033[32m";
+        theme.bad = "\033[1;31m";
+        theme.warn = "\033[33m";
+        theme.accent = "\033[36m";
+        theme.reset = "\033[0m";
+        return theme;
+    }
 
     inline RunInfo QueryRunInfo() {
         RunInfo info;
@@ -115,41 +162,41 @@ namespace cadence {
     }
 
     // Provenance. Anyone quoting a number from this report needs to know what produced it, and a throttled run looks exactly like a healthy one once the numbers are pasted somewhere else.
-    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, bool anyEstimated) {
-        out << "cadence report\n";
-        out << "  device    " << info.deviceName;
+    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, bool anyEstimated, const Theme& theme) {
+        out << theme.title << "cadence report" << theme.reset << "\n";
+        out << "  " << theme.key << "device" << theme.reset << "    " << info.deviceName;
         if (info.cudaAvailable) {
             out << " (sm_" << info.computeCapabilityMajor << info.computeCapabilityMinor << ")";
             out << ", sm clock <= " << info.maxSmClockMhz << " MHz, mem clock <= " << info.maxMemClockMhz << " MHz";
         }
         out << "\n";
         if (info.cudaAvailable) {
-            out << "  clocks    not locked by cadence; run `nvidia-smi -lgc " << info.maxSmClockMhz << "` before comparing runs\n";
+            out << "  " << theme.key << "clocks" << theme.reset << "    not locked by cadence; run `nvidia-smi -lgc " << info.maxSmClockMhz << "` before comparing runs\n";
         }
-        out << "  warmup    " << config.warmupIterations << " iteration(s) discarded per label\n";
+        out << "  " << theme.key << "warmup" << theme.reset << "    " << config.warmupIterations << " iteration(s) discarded per label\n";
         if (config.sampleEvery > 1) {
             // Without this line the counts are unreadable: a 10000-iteration run reporting 1000 samples looks like a bug rather than a setting.
-            out << "  sampling  1 in " << config.sampleEvery << " measured; outliers between samples are not represented\n";
+            out << "  " << theme.key << "sampling" << theme.reset << "  1 in " << config.sampleEvery << " measured; outliers between samples are not represented\n";
         }
         if (failedRecords > 0) {
-            out << "  WARNING   " << failedRecords << " record(s) dropped -- event creation or elapsed-time query failed\n";
+            out << "  " << theme.warn << "WARNING" << theme.reset << "   " << failedRecords << " record(s) dropped -- event creation or elapsed-time query failed\n";
         }
         if (stalledClockRecords > 0) {
             // Worth a warning rather than a silent drop: it says the host timings in this report are thinner than the counts suggest, and it says something true about the machine that the user probably did not know.
-            out << "  WARNING   " << stalledClockRecords << " host span(s) dropped -- the monotonic clock did not advance across them, which happens on virtualized hosts; GPU figures are unaffected\n";
+            out << "  " << theme.warn << "WARNING" << theme.reset << "   " << stalledClockRecords << " host span(s) dropped -- the monotonic clock did not advance across them, which happens on virtualized hosts; GPU figures are unaffected\n";
         }
         if (capturedScopes > 0) {
             // Not a failure so much as a boundary: the scopes are inside a region cadence cannot instrument, and saying so is what stops the missing rows from reading as an absence of work.
-            out << "  WARNING   " << capturedScopes << " scope(s) skipped -- their stream was capturing into a CUDA graph, which cannot carry timing events; wrap the graph launch instead\n";
+            out << "  " << theme.warn << "WARNING" << theme.reset << "   " << capturedScopes << " scope(s) skipped -- their stream was capturing into a CUDA graph, which cannot carry timing events; wrap the graph launch instead\n";
         }
         if (anyEstimated) {
             // The counts stay honest, so a reader comparing n against the number of iterations needs to be told which columns thinned out and which did not.
-            out << "  sampled   the run outgrew its sample reservoir; n, mean, stddev, min, max and the deadline verdict are exact, p50/p95 and the distribution are estimates\n";
+            out << "  " << theme.key << "sampled" << theme.reset << "   the run outgrew its sample reservoir; n, mean, stddev, min, max and the deadline verdict are exact, p50/p95 and the distribution are estimates\n";
         }
     }
 
     // The table. Column widths come from the content rather than from constants, so a long label widens its column instead of wrapping the row.
-    inline void WriteStatsTable(std::ostream& out, const std::vector<Stats>& stats, bool unicode) {
+    inline void WriteStatsTable(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
         if (stats.empty()) {
             out << "\n  no measurements recorded\n";
             return;
@@ -197,7 +244,7 @@ namespace cadence {
         for (std::size_t i = 2; i < DisplayWidth(heading); ++i) {
             rule += unicode ? "\xe2\x94\x80" : "-";  // U+2500 BOX DRAWINGS LIGHT HORIZONTAL
         }
-        out << "\n" << heading << "\n  " << rule << "\n";
+        out << "\n" << theme.key << heading << theme.reset << "\n  " << theme.key << rule << theme.reset << "\n";
 
         for (const Row& row : rows) {
             const std::string* cells[8] = {&row.label, &row.scope, &row.count, &row.mean, &row.p50, &row.p95, &row.max, &row.jitter};
@@ -207,12 +254,13 @@ namespace cadence {
                 PadTo(cell, widths[column]);
                 out << cell << "  ";
             }
-            out << row.distribution << "\n";
+            // Last on the line, so colouring it cannot disturb a column to its right.
+            out << theme.accent << row.distribution << theme.reset << "\n";
         }
     }
 
     // The one line of arithmetic every reader of this report does by hand. Summing the device means gives GPU time per iteration; a label that recorded host time but no device time is a plain CADENCE_SCOPE, and when exactly one of those covers at least as much time as the GPU work it is almost certainly the loop body, which makes the remainder launch and synchronization overhead.
-    inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode) {
+    inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
         double deviceTotalMs = 0.0;
         std::size_t deviceLabels = 0;
         for (const Stats& row : stats) {
@@ -237,7 +285,7 @@ namespace cadence {
         // Keys line up with the provenance block above, which uses the same eight-wide column.
         std::string key = "device";
         PadTo(key, 8);
-        out << "\n  " << key << "  " << FormatDuration(deviceTotalMs, unicode) << " across " << deviceLabels << " label(s)\n";
+        out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(deviceTotalMs, unicode) << " across " << deviceLabels << " label(s)\n";
 
         if (hostOnlyLabels == 1 && span != nullptr && span->meanMs >= deviceTotalMs) {
             const double overheadMs = span->meanMs - deviceTotalMs;
@@ -245,13 +293,13 @@ namespace cadence {
             std::snprintf(share, sizeof(share), "%.1f%%", 100.0 * deviceTotalMs / span->meanMs);
             key = span->label;
             PadTo(key, 8);
-            out << "  " << key << "  " << FormatDuration(span->meanMs, unicode) << ", of which " << share << " is GPU work; "
+            out << "  " << theme.key << key << theme.reset << "  " << FormatDuration(span->meanMs, unicode) << ", of which " << share << " is GPU work; "
                 << FormatDuration(overheadMs, unicode) << " is launch and synchronization\n";
         }
     }
 
     // The deadline line. A mean cannot answer "did this loop hold its deadline", because a loop that misses one iteration in fifty has a perfectly healthy mean and a real problem. This answers it as a count, and draws the bar against p95 rather than the mean so the figure shown is one you could plan against.
-    inline void WriteBudget(std::ostream& out, const std::vector<Stats>& stats, bool unicode) {
+    inline void WriteBudget(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
         const Stats* held = nullptr;
         for (const Stats& row : stats) {
             if (row.budgetMs > 0.0 && row.count > 0) held = &row;
@@ -266,13 +314,16 @@ namespace cadence {
 
         std::string key = "deadline";
         PadTo(key, 8);
-        out << "\n  " << key << "  " << FormatDuration(held->budgetMs, unicode) << " on " << held->label << " ("
+        out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(held->budgetMs, unicode) << " on " << held->label << " ("
             << ScopeKindName(held->kind) << ")\n";
 
-        std::string verdict = held->overBudget == 0 ? "met" : "MISSED";
+        const bool missed = held->overBudget > 0;
+        std::string verdict = missed ? "MISSED" : "met";
         PadTo(verdict, 8);
-        out << "  " << verdict << "  " << met << "/" << held->count << " iterations inside budget (" << metShare
-            << "); worst " << FormatDuration(held->maxMs, unicode) << " at " << worstShare << " of budget\n";
+        // Coloured after padding: the escapes would otherwise count as cells and push this line out of step with the keys above it.
+        out << "  " << (missed ? theme.bad : theme.good) << verdict << theme.reset << "  " << met << "/" << held->count
+            << " iterations inside budget (" << metShare << "); worst " << FormatDuration(held->maxMs, unicode) << " at "
+            << worstShare << " of budget\n";
 
         // Filled against p95 and clamped at full: past the deadline the only thing worth reading is that it was passed, and a bar that runs off the line says that more plainly than a longer bar would.
         constexpr std::size_t NUM_BAR_CELLS = 40;
@@ -280,27 +331,30 @@ namespace cadence {
         std::size_t filled = static_cast<std::size_t>(share * static_cast<double>(NUM_BAR_CELLS));
         if (filled > NUM_BAR_CELLS) filled = NUM_BAR_CELLS;
 
-        std::string bar;
+        // Split so the two halves can take different colours; nothing measures the bar's width afterwards, so escapes are safe inside it.
+        std::string filledBar, emptyBar;
         for (std::size_t cell = 0; cell < NUM_BAR_CELLS; ++cell) {
             if (cell < filled) {
-                bar += unicode ? "\xe2\x96\x88" : "#";  // U+2588 FULL BLOCK
+                filledBar += unicode ? "\xe2\x96\x88" : "#";  // U+2588 FULL BLOCK
             } else {
-                bar += unicode ? "\xe2\x96\x91" : ".";  // U+2591 LIGHT SHADE
+                emptyBar += unicode ? "\xe2\x96\x91" : ".";  // U+2591 LIGHT SHADE
             }
         }
         char p95Share[32];
         std::snprintf(p95Share, sizeof(p95Share), "%.0f%%", 100.0 * share);
-        out << "            [" << bar << "]  p95 " << FormatDuration(held->p95Ms, unicode) << " at " << p95Share << "\n";
+        // The bar is coloured on p95 against the deadline, which is a different question from the verdict above it: a loop can miss occasionally and still have a p95 comfortably inside budget, and that combination is worth seeing at a glance.
+        out << "            [" << (share > 1.0 ? theme.bad : theme.good) << filledBar << theme.reset << theme.key << emptyBar
+            << theme.reset << "]  p95 " << FormatDuration(held->p95Ms, unicode) << " at " << p95Share << "\n";
     }
 
     // The slowest passes of the loop, broken down by stage. The table above says how often the loop missed; this says which passes did and where the time went in them, which is the question the table always raises next. A miss is usually one stage rather than everything being slightly slow, and that is visible here and nowhere else in the report.
-    inline void WriteWorstIterations(std::ostream& out, const std::vector<TraceIteration>& worst, bool unicode) {
+    inline void WriteWorstIterations(std::ostream& out, const std::vector<TraceIteration>& worst, bool unicode, const Theme& theme) {
         if (worst.empty()) return;
-        out << "\n  slowest iterations\n";
+        out << "\n  " << theme.key << "slowest iterations" << theme.reset << "\n";
         for (const TraceIteration& iteration : worst) {
             std::string head = "    #" + std::to_string(iteration.index);
             PadTo(head, 10);
-            out << head << RightAligned(FormatDuration(iteration.spanMs, unicode), 8) << "  ";
+            out << theme.accent << head << theme.reset << RightAligned(FormatDuration(iteration.spanMs, unicode), 8) << "  ";
             // Device spans only. The host-issue side of each label is carried for the trace, where seeing a launch sit ahead of its kernel is the point, but repeating it here would say what the summary table already said.
             bool firstSpan = true;
             for (const TraceSpan& span : iteration.spans) {
@@ -316,14 +370,16 @@ namespace cadence {
 
     inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0, const std::vector<TraceIteration>& worst = {}) {
         const bool unicode = config.unicodeOutput;
+        // Resolved per stream rather than once per run, so the console copy and the outputPath copy of the same report each get what they can render.
+        const Theme theme = SelectTheme(out, config.colorOutput);
         bool anyEstimated = false;
         for (const Stats& row : stats) anyEstimated = anyEstimated || row.estimated;
-        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, anyEstimated);
-        WriteStatsTable(out, stats, unicode);
-        WriteBudget(out, stats, unicode);
-        WriteWorstIterations(out, worst, unicode);
-        WriteSummary(out, stats, unicode);
-        out << "\n  elapsed time only; for occupancy or bandwidth use `ncu`.\n";
+        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, anyEstimated, theme);
+        WriteStatsTable(out, stats, unicode, theme);
+        WriteBudget(out, stats, unicode, theme);
+        WriteWorstIterations(out, worst, unicode, theme);
+        WriteSummary(out, stats, unicode, theme);
+        out << "\n  " << theme.key << "elapsed time only; for occupancy or bandwidth use `ncu`." << theme.reset << "\n";
         out.flush();
     }
 
