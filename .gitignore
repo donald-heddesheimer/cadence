@@ -4,6 +4,7 @@ dev/
 # Working notes stay out; the published measurement writeup is tracked.
 docs/*
 !docs/overhead.md
+!docs/case-study.md
 !docs/report.svg
 !docs/render_report_svg.py
 !docs/timeline.png
