@@ -30,6 +30,48 @@ to +230 ns per device scope depending on the run, or roughly 5 to 7%. Both
 failures they prevent are silent, which is why neither is configurable.
 `CADENCE_SCOPE` touches no CUDA and pays neither.
 
+## Against the hand-rolled version
+
+The alternative cadence is usually weighed against is not another tool, it is
+twenty lines someone writes inline: record either side of the launch, block on
+the stop event, read the elapsed time out. Measured the same interleaved way,
+with the events created once outside the loop rather than per scope, which is the
+charitable version of that code:
+
+| | ns/scope | vs `CADENCE_KERNEL` |
+|---|---:|---:|
+| hand-rolled, trivial kernel | 6470 | 1.8x |
+| hand-rolled, 17.4 µs kernel | 6970 | 2.3x |
+
+And on the whole loop, 50,000 launches against the same uninstrumented baseline:
+
+| | wall clock | |
+|---|---:|---:|
+| uninstrumented | 119 ms | 1.00x |
+| `CADENCE_KERNEL` | 320 ms | 2.7x |
+| hand-rolled | 443 ms | 3.7x |
+
+Two things in here are worth stating plainly because the first one is not what
+was expected.
+
+**The hand-rolled cost does not scale with kernel duration.** The obvious
+prediction is that blocking on a 17 µs kernel costs 17 µs, and it does not: the
+figure moves from 6470 to 6970 ns, near enough flat. What a blocking read buys is
+a fixed round trip to the driver and back, not a wait proportional to the work,
+because the baseline it is measured against is already waiting for the same
+kernel.
+
+**The gap widens over real work anyway, for the opposite reason.** cadence gets
+*cheaper* over a longer kernel -- 3390 ns against a trivial one, 3090 ns against
+the 17 µs one -- because its two records go out while the GPU already has work in
+flight. The blocking version cannot do that by construction. So the ratio moves
+from 1.8x to 2.3x as the kernels get more realistic, which is the opposite of the
+direction a reader would guess.
+
+These figures were taken on unpinned clocks, so read the ratios rather than the
+absolutes; each ratio comes from a single interleaved run and reproduces to
+within about 5% across runs.
+
 ## Where the time goes
 
 Almost all of `CADENCE_KERNEL` is two `cudaEventRecord` calls at roughly 1.4 µs
