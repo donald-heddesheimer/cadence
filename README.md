@@ -199,17 +199,11 @@ Host, disabled-build and self-contained-header tests need no GPU and no CUDA
 toolkit. Device tests build when `nvcc` is found and skip themselves when no
 device answers.
 
-Every push runs gcc and clang across Debug and Release, ASan+UBSan, TSan, a CUDA
-compile job, and an install-and-consume job that builds a separate project
-against `find_package(cadence)` — because a header-only library that does not
-install cleanly is a header-only library nobody can use.
-
-The coverage figure is the host-reachable surface. On a runner with no CUDA
-toolkit `__has_include(<cuda_runtime.h>)` is false and the device paths are
-preprocessed away before gcov sees them, so the number is what the no-GPU tests
-genuinely reach rather than one diluted by lines only a GPU could execute. Those
-lines are compile-checked in the same run and exercised by `cadence_device_tests`
-on real hardware.
+`examples/` has a standalone CUDA loop, and a [ROS 2 node](examples/ros2) whose
+timer callback is held to its own period — so the report's verdict is "did this
+callback hold its rate", which is the question a robotics developer actually has.
+That package builds with colcon and sits outside this build and outside CI,
+because a header-only library should not make every consumer care about ROS 2.
 
 ## What it does not do
 
