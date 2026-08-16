@@ -28,14 +28,41 @@
 namespace cadence {
     namespace detail {
 
+    // One GPU's view of one label: the work it executed, and the CPU time this process spent issuing that work to it.
+    //
+    // Split rather than pooled because pooling answers the wrong question. Someone running the same stage on two cards is looking precisely for the difference between them -- a slower card, a colder clock, a stream that is not getting fed -- and a mean over both is a number that describes neither.
+    struct DeviceSamples {
+        int device = 0;
+        SampleSet gpu;    // GPU execution, measured with CUDA events.
+        SampleSet issue;  // CPU time spent issuing it.
+    };
+
     // Accumulated samples for one label, across every flush so far. Indexed by LabelId.
     struct LabelSamples {
-        SampleSet device;
-        SampleSet host;               // Host scopes, or CPU-issue time for device scopes.
+        std::vector<DeviceSamples> devices;  // Ordered by device id; empty until a device scope records.
+        SampleSet host;               // Plain host scopes, which belong to no GPU.
         std::uint64_t seen = 0;       // Observations kept for statistics, warmup included.
         std::uint64_t discarded = 0;  // Observations dropped as warmup.
-        bool hasDevice = false;
+        bool hasDevice = false;       // Set as soon as a device record arrives, warmup included, so a label does not read as host-only while its first iterations are being discarded.
     };
+
+    // The slot for one device, created on first sight. A process uses a handful of GPUs, so a linear scan is the whole implementation -- the same shape as LaneFor and ThreadState::CacheFor. Kept ordered by device id so the report's rows come out in a stable order no matter which card recorded first.
+    //
+    // A free function rather than a Registry member because this is where the per-device keying lives, and a host-only test with no CUDA toolkit present can reach it here and nowhere else.
+    inline DeviceSamples& SlotFor(LabelSamples& samples, LabelId label, int device) {
+        std::size_t index = 0;
+        while (index < samples.devices.size() && samples.devices[index].device < device) ++index;
+        if (index == samples.devices.size() || samples.devices[index].device != device) {
+            DeviceSamples slot;
+            slot.device = device;
+            // Seeded from the label and the device together, so which observations a capped run keeps is reproducible from one run to the next and two cards do not thin their reservoirs in lockstep.
+            const std::uint64_t seed = (static_cast<std::uint64_t>(label) + 1) * 131u + static_cast<std::uint64_t>(device) + 1u;
+            slot.gpu.rngState = 0x9E3779B97F4A7C15ULL * seed;
+            slot.issue.rngState = 0xBF58476D1CE4E5B9ULL * seed;
+            samples.devices.insert(samples.devices.begin() + static_cast<std::ptrdiff_t>(index), std::move(slot));
+        }
+        return samples.devices[index];
+    }
 
 #if CADENCE_HAS_CUDA
     // The device a scope's events must be created on, which is the one its kernel launch will go to. Measured at 20.6 ns on an RTX A4000, against 1490 ns for the cudaEventRecord it protects.
@@ -206,10 +233,12 @@ namespace cadence {
                             LabelSamples& samples = SamplesFor(record.label);
                             samples.hasDevice = true;
                             if (KeepSample(samples, warmup)) {
-                                samples.device.Add(static_cast<double>(elapsedMs), budgetMs, capacity);
+                                // The device is already on the record, so keying by it costs a scan over a handful of slots and nothing on the hot path.
+                                DeviceSamples& slot = SlotFor(samples, record.label, record.device < 0 ? 0 : record.device);
+                                slot.gpu.Add(static_cast<double>(elapsedMs), budgetMs, capacity);
                                 // The GPU figure came from CUDA events and stands on its own; only the host half is dropped when the clock did not move, so a stalled clock costs you the issue-time row and nothing else.
                                 if (record.hostIssueNs > 0) {
-                                    samples.host.Add(static_cast<double>(record.hostIssueNs) * 1e-6, budgetMs, capacity);
+                                    slot.issue.Add(static_cast<double>(record.hostIssueNs) * 1e-6, budgetMs, capacity);
                                 } else {
                                     ++stalledClockRecords_;
                                 }
@@ -298,14 +327,23 @@ namespace cadence {
             results.reserve(samples_.size());
             for (std::size_t id = 0; id < samples_.size(); ++id) {
                 const LabelSamples& samples = samples_[id];
-                if (samples.device.Empty() && samples.host.Empty()) continue;
+                if (samples.devices.empty() && samples.host.Empty()) continue;
                 const std::string& name = id < names.size() ? names[id] : std::string();
-                if (samples.hasDevice) {
-                    const double budget = target.Matches(id, ScopeKind::Device) ? config.budgetMs : 0.0;
-                    results.push_back(ComputeStatsFromSet(name, ScopeKind::Device, samples.device, samples.discarded, budget));
+                // One pair of rows per GPU. With a single device -- which is nearly every run -- this emits exactly the two rows it always did.
+                for (const DeviceSamples& slot : samples.devices) {
+                    const double gpuBudget = target.Matches(id, ScopeKind::Device) ? config.budgetMs : 0.0;
+                    Stats gpu = ComputeStatsFromSet(name, ScopeKind::Device, slot.gpu, samples.discarded, gpuBudget);
+                    gpu.device = slot.device;
+                    results.push_back(std::move(gpu));
+                    if (slot.issue.Empty()) continue;
+                    // The CPU-issue side of the same label: compare it against the device row above to see launch-bound vs compute-bound.
+                    const double issueBudget = target.Matches(id, ScopeKind::Host) ? config.budgetMs : 0.0;
+                    Stats issue = ComputeStatsFromSet(name, ScopeKind::Host, slot.issue, samples.discarded, issueBudget);
+                    issue.device = slot.device;
+                    results.push_back(std::move(issue));
                 }
                 if (!samples.host.Empty()) {
-                    // For a device scope this row is the CPU-issue side of the same label: compare it against the device row to see launch-bound vs compute-bound.
+                    // A plain CADENCE_SCOPE, which named no stream and so belongs to no GPU; its row keeps device = -1.
                     const double budget = target.Matches(id, ScopeKind::Host) ? config.budgetMs : 0.0;
                     results.push_back(ComputeStatsFromSet(name, ScopeKind::Host, samples.host, samples.discarded, budget));
                 }
@@ -530,13 +568,12 @@ namespace cadence {
         }
 #endif
 
-        // Called with samplesMutex_ held. Each set's reservoir is seeded from the label it belongs to, so which observations survive a capped run is reproducible from one run to the next.
+        // Called with samplesMutex_ held. The host set's reservoir is seeded from the label it belongs to, so which observations survive a capped run is reproducible from one run to the next; the per-device sets are seeded the same way by SlotFor, which is where they are created.
         LabelSamples& SamplesFor(LabelId id) {
             if (id >= samples_.size()) {
                 const std::size_t first = samples_.size();
                 samples_.resize(id + 1);
                 for (std::size_t i = first; i <= id; ++i) {
-                    samples_[i].device.rngState = 0x9E3779B97F4A7C15ULL * (i + 1);
                     samples_[i].host.rngState = 0xBF58476D1CE4E5B9ULL * (i + 1);
                 }
             }

@@ -161,6 +161,20 @@ namespace cadence {
         return std::string(width - cells, ' ') + text;
     }
 
+    // Whether this report has more than one GPU in it, which is what decides several presentation questions at once: the device column appears, the deadline names the card it is about, and the summary stops adding two cards' spans into a total no iteration ever took.
+    inline bool HasMultipleDevices(const std::vector<Stats>& stats) {
+        int seen = -1;
+        for (const Stats& row : stats) {
+            if (row.device < 0) continue;
+            if (seen < 0) {
+                seen = row.device;
+            } else if (row.device != seen) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Provenance. Anyone quoting a number from this report needs to know what produced it, and a throttled run looks exactly like a healthy one once the numbers are pasted somewhere else.
     inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, bool anyEstimated, const Theme& theme) {
         out << theme.title << "cadence report" << theme.reset << "\n";
@@ -202,38 +216,45 @@ namespace cadence {
             return;
         }
 
-        struct Row {
-            std::string label, scope, count, mean, p50, p95, max, jitter, distribution;
-        };
+        // The device column earns a place only when there is more than one GPU to tell apart. Nearly every run has one, and a column of identical zeroes is a column of noise; a run that has two needs it, because two rows with the same label and different numbers otherwise read as a bug in the report.
+        const bool multipleDevices = HasMultipleDevices(stats);
 
-        std::vector<Row> rows;
+        // Label and scope read as text and belong on the left; every column after them is a number and lines up on the right.
+        constexpr std::size_t NUM_TEXT_COLUMNS = 2;
+        std::vector<std::string> headings = {"label", "scope"};
+        if (multipleDevices) headings.push_back("dev");
+        for (const char* heading : {"n", "mean", "p50", "p95", "max", "jitter"}) headings.push_back(heading);
+
+        std::vector<std::vector<std::string>> rows;
+        std::vector<std::string> distributions;
         rows.reserve(stats.size());
+        distributions.reserve(stats.size());
         for (const Stats& row : stats) {
-            Row formatted;
-            formatted.label = row.label;
-            formatted.scope = ScopeKindName(row.kind);
-            formatted.count = std::to_string(row.count);
-            formatted.mean = FormatDuration(row.meanMs, unicode);
-            formatted.p50 = FormatDuration(row.p50Ms, unicode);
-            formatted.p95 = FormatDuration(row.p95Ms, unicode);
-            formatted.max = FormatDuration(row.maxMs, unicode);
-            formatted.jitter = FormatDuration(row.jitterMs, unicode);
-            formatted.distribution = RenderHistogram(row.histogram, unicode);
-            rows.push_back(std::move(formatted));
+            std::vector<std::string> cells;
+            cells.reserve(headings.size());
+            cells.push_back(row.label);
+            cells.push_back(ScopeKindName(row.kind));
+            // A plain host span belongs to no GPU, so its cell stays empty rather than claiming device 0.
+            if (multipleDevices) cells.push_back(row.device < 0 ? std::string() : std::to_string(row.device));
+            cells.push_back(std::to_string(row.count));
+            cells.push_back(FormatDuration(row.meanMs, unicode));
+            cells.push_back(FormatDuration(row.p50Ms, unicode));
+            cells.push_back(FormatDuration(row.p95Ms, unicode));
+            cells.push_back(FormatDuration(row.maxMs, unicode));
+            cells.push_back(FormatDuration(row.jitterMs, unicode));
+            rows.push_back(std::move(cells));
+            distributions.push_back(RenderHistogram(row.histogram, unicode));
         }
 
-        const char* const HEADINGS[8] = {"label", "scope", "n", "mean", "p50", "p95", "max", "jitter"};
-        std::array<std::size_t, 8> widths{};
-        for (std::size_t column = 0; column < widths.size(); ++column) widths[column] = DisplayWidth(HEADINGS[column]);
-        for (const Row& row : rows) {
-            const std::string* cells[8] = {&row.label, &row.scope, &row.count, &row.mean, &row.p50, &row.p95, &row.max, &row.jitter};
-            for (std::size_t column = 0; column < widths.size(); ++column) widths[column] = std::max(widths[column], DisplayWidth(*cells[column]));
+        std::vector<std::size_t> widths(headings.size());
+        for (std::size_t column = 0; column < widths.size(); ++column) widths[column] = DisplayWidth(headings[column]);
+        for (const std::vector<std::string>& row : rows) {
+            for (std::size_t column = 0; column < widths.size(); ++column) widths[column] = std::max(widths[column], DisplayWidth(row[column]));
         }
 
         std::string heading = "  ";
         for (std::size_t column = 0; column < widths.size(); ++column) {
-            // Label and scope read as text and belong on the left; every other column is a number and lines up on the right.
-            std::string cell = column < 2 ? HEADINGS[column] : RightAligned(HEADINGS[column], widths[column]);
+            std::string cell = column < NUM_TEXT_COLUMNS ? headings[column] : RightAligned(headings[column], widths[column]);
             PadTo(cell, widths[column]);
             heading += cell + "  ";
         }
@@ -246,29 +267,36 @@ namespace cadence {
         }
         out << "\n" << theme.key << heading << theme.reset << "\n  " << theme.key << rule << theme.reset << "\n";
 
-        for (const Row& row : rows) {
-            const std::string* cells[8] = {&row.label, &row.scope, &row.count, &row.mean, &row.p50, &row.p95, &row.max, &row.jitter};
+        for (std::size_t index = 0; index < rows.size(); ++index) {
             out << "  ";
             for (std::size_t column = 0; column < widths.size(); ++column) {
-                std::string cell = column < 2 ? *cells[column] : RightAligned(*cells[column], widths[column]);
+                std::string cell = column < NUM_TEXT_COLUMNS ? rows[index][column] : RightAligned(rows[index][column], widths[column]);
                 PadTo(cell, widths[column]);
                 out << cell << "  ";
             }
             // Last on the line, so colouring it cannot disturb a column to its right.
-            out << theme.accent << row.distribution << theme.reset << "\n";
+            out << theme.accent << distributions[index] << theme.reset << "\n";
         }
     }
 
     // The one line of arithmetic every reader of this report does by hand. Summing the device means gives GPU time per iteration; a label that recorded host time but no device time is a plain CADENCE_SCOPE, and when exactly one of those covers at least as much time as the GPU work it is almost certainly the loop body, which makes the remainder launch and synchronization overhead.
     inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
-        double deviceTotalMs = 0.0;
-        std::size_t deviceLabels = 0;
+        // Totalled per GPU rather than over all of them, because two cards run at the same time: adding their spans together produces a duration no iteration ever took, and it would grow with every GPU added while the loop got faster.
+        struct DeviceTotal {
+            int device = -1;
+            double totalMs = 0.0;
+            std::size_t labels = 0;
+        };
+        std::vector<DeviceTotal> totals;
         for (const Stats& row : stats) {
             if (row.kind != ScopeKind::Device) continue;
-            deviceTotalMs += row.meanMs;
-            ++deviceLabels;
+            std::size_t index = 0;
+            while (index < totals.size() && totals[index].device != row.device) ++index;
+            if (index == totals.size()) totals.push_back(DeviceTotal{row.device, 0.0, 0});
+            totals[index].totalMs += row.meanMs;
+            ++totals[index].labels;
         }
-        if (deviceLabels == 0) return;
+        if (totals.empty()) return;
 
         const Stats* span = nullptr;
         std::size_t hostOnlyLabels = 0;
@@ -285,9 +313,15 @@ namespace cadence {
         // Keys line up with the provenance block above, which uses the same eight-wide column.
         std::string key = "device";
         PadTo(key, 8);
-        out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(deviceTotalMs, unicode) << " across " << deviceLabels << " label(s)\n";
+        for (const DeviceTotal& total : totals) {
+            out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(total.totalMs, unicode) << " across " << total.labels << " label(s)";
+            if (totals.size() > 1 && total.device >= 0) out << " on device " << total.device;
+            out << "\n";
+        }
 
-        if (hostOnlyLabels == 1 && span != nullptr && span->meanMs >= deviceTotalMs) {
+        // The remainder is launch and synchronization only while there is one GPU to subtract. With several running concurrently the loop span is not the sum of their work plus overhead, and there is no arithmetic here that would make it one, so the line is withheld rather than guessed at.
+        const double deviceTotalMs = totals.front().totalMs;
+        if (totals.size() == 1 && hostOnlyLabels == 1 && span != nullptr && span->meanMs >= deviceTotalMs) {
             const double overheadMs = span->meanMs - deviceTotalMs;
             char share[32];
             std::snprintf(share, sizeof(share), "%.1f%%", 100.0 * deviceTotalMs / span->meanMs);
@@ -300,22 +334,33 @@ namespace cadence {
 
     // The deadline line. A mean cannot answer "did this loop hold its deadline", because a loop that misses one iteration in fifty has a perfectly healthy mean and a real problem. This answers it as a count, and draws the bar against p95 rather than the mean so the figure shown is one you could plan against.
     inline void WriteBudget(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
+        // One label recorded on several GPUs puts the deadline on every one of its rows, and there is only one line to spend. It goes to the worst offender: taking the last row would make the verdict depend on which card happened to sort later, and a deadline line that says "met" while another card missed is the single most misleading thing this report could print.
         const Stats* held = nullptr;
+        std::size_t numHeld = 0;
         for (const Stats& row : stats) {
-            if (row.budgetMs > 0.0 && row.count > 0) held = &row;
+            if (row.budgetMs <= 0.0 || row.count == 0) continue;
+            ++numHeld;
+            const bool worse = held == nullptr || row.overBudget > held->overBudget ||
+                               (row.overBudget == held->overBudget && row.maxMs > held->maxMs);
+            if (worse) held = &row;
         }
         if (held == nullptr) return;
 
         const std::size_t met = held->count - held->overBudget;
+        // Truncated rather than rounded, so a share only reads 100.0% when every iteration actually held. On a long run one miss in 3157 is 99.968%, which %.1f rounds up -- and a line saying MISSED beside 100.0% is precisely the confusion this whole section exists to prevent.
+        const double metPercent = 100.0 * static_cast<double>(met) / static_cast<double>(held->count);
         char metShare[32];
-        std::snprintf(metShare, sizeof(metShare), "%.1f%%", 100.0 * static_cast<double>(met) / static_cast<double>(held->count));
+        std::snprintf(metShare, sizeof(metShare), "%.1f%%", std::floor(metPercent * 10.0) / 10.0);
         char worstShare[32];
         std::snprintf(worstShare, sizeof(worstShare), "%.0f%%", 100.0 * held->maxMs / held->budgetMs);
 
         std::string key = "deadline";
         PadTo(key, 8);
         out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(held->budgetMs, unicode) << " on " << held->label << " ("
-            << ScopeKindName(held->kind) << ")\n";
+            << ScopeKindName(held->kind);
+        // Only when there was a choice to make, so the single-GPU line is unchanged.
+        if (numHeld > 1 && held->device >= 0) out << " on device " << held->device << ", the worst of " << numHeld;
+        out << ")\n";
 
         const bool missed = held->overBudget > 0;
         std::string verdict = missed ? "MISSED" : "met";
