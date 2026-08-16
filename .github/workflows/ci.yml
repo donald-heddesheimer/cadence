@@ -97,7 +97,13 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Report
         run: |
+          # negative_hits is a gcov bug, not a coverage problem: on an inlined
+          # ternary it can emit "branch 1 taken -1", which is not a number of
+          # times anything happened. See gcc PR 68080. Warning once per file
+          # keeps it visible in the log while letting the run finish; the gate
+          # below is on lines, which the bug does not touch.
           gcovr -r . --filter 'include/cadence/' \
+            --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
             --txt coverage.txt --xml coverage.xml \
             --fail-under-line 85
           cat coverage.txt
