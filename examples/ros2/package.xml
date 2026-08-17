@@ -3,12 +3,7 @@
 <package format="3">
   <name>cadence_ros2_example</name>
   <version>0.2.0</version>
-  <description>
-    A timer-driven ROS 2 node whose callback runs a small CUDA pipeline,
-    instrumented with cadence. The node publishes the latency of each callback;
-    cadence reports the distribution behind those numbers and which stage the
-    time went to. Not part of the cadence build or CI -- build it with colcon.
-  </description>
+  <description>A ROS 2 CUDA pipeline demonstrating cadence stage and deadline instrumentation.</description>
   <maintainer email="donald-heddesheimer@users.noreply.github.com">donald-heddesheimer</maintainer>
   <license>MIT</license>
   <url type="repository">https://github.com/donald-heddesheimer/cadence</url>

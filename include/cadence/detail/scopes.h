@@ -89,7 +89,8 @@ namespace cadence {
 
         ~ScopedKernel() {
             if (!active_) return;
-            // Capture can open inside the scope as easily as before it, and a stop event recorded into a graph is exactly as damaging as a start one. Both events go back to the thread's own cache unrecorded; the start event is already spent, which costs this one observation and nothing else. Checked before anything else here so that only this one call sits between the work and the stop event that closes it.
+            // Capture may begin inside the scope. Return both events without
+            // recording the stop event into the graph.
             if (CADENCE_UNLIKELY(detail::StreamIsCapturing(stream_))) {
                 detail::ThreadState& state = detail::TlsState();
                 detail::GiveBackEvent(state, device_, start_);
@@ -142,7 +143,7 @@ namespace cadence {
             detail::ThreadState& state = detail::TlsState();
             detail::StreamChain* chain = state.FindChain(stream_);
             generation_ = detail::Registry::Instance().FlushGeneration();
-            // A tail from an earlier flush is a handle to an event already back in the pool, so age is checked before the pointer is trusted. A tail from another device cannot be paired with a stop event from this one, so it is treated the same way: the chain restarts here.
+            // Restart chains whose tail belongs to an earlier flush or device.
             if (chain->generation != generation_ || !chain->tail || chain->device != device_) {
                 cudaEvent_t head = detail::TakeEvent(state, device_);
                 if (CADENCE_UNLIKELY(!head)) {
@@ -177,7 +178,7 @@ namespace cadence {
             const std::int64_t hostEndNs = detail::NowNs();
             detail::StreamChain* chain = state.FindChain(stream_);
             if (CADENCE_UNLIKELY(!stop)) {
-                // Break the chain rather than leave a head nobody will ever release; the record carries the orphan back to the pool via Flush().
+                // Break the chain; Flush() returns the orphaned event to the pool.
                 chain->tail = nullptr;
                 if (ownsStart_) {
                     Append(state, detail::DeviceRecord{labelId_, true, device_, stream_, start_, nullptr, 0, 0});

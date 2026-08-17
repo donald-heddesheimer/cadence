@@ -1,7 +1,5 @@
-// cadence: per-thread recording state.
-//
-// Everything a scope touches on the way in and out lives here
-// The block outlives its thread. Flush() may be walking it at the moment the thread exits, so ownership is shared and the thread merely marks it retired on the way out; the registry drops it once it is both retired and drained.
+// Per-thread recording state. Shared ownership keeps a block alive during a
+// concurrent flush; retired blocks are removed after they drain.
 #pragma once
 
 #include <chrono>
@@ -15,12 +13,12 @@
 namespace cadence {
     namespace detail {
 
-    // Absolute nanoseconds on the steady clock. Spans need a position as well as a length before they can be drawn on a timeline, and one origin shared by every scope is what lets a host span and a GPU span be compared at all. Lives beside the records that store its result.
+    // Absolute steady-clock timestamps used for shared host/device timelines.
     CADENCE_ALWAYS_INLINE std::int64_t NowNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
-    // Elapsed times are carried as raw clock ticks and converted to milliseconds at flush
+    // Convert raw clock durations to milliseconds during flush.
     struct HostRecord {
         LabelId label;
         std::int64_t startNs;  // steady_clock since its epoch. Carried so a span can be placed on a timeline, not just measured.
@@ -30,13 +28,13 @@ namespace cadence {
 #if CADENCE_HAS_CUDA
     struct DeviceRecord {
         LabelId label;
-        bool ownsStart; // false when start is prev stage's stop event
-        int device;     // Device the events were created on; they go back to that device's pool and nowhere else.
+        bool ownsStart;  // False when start is the previous stage's stop event.
+        int device;      // Device that owns the events.
         cudaStream_t stream;
         cudaEvent_t start;
         cudaEvent_t stop;
         std::int64_t hostStartNs;  // When the CPU began issuing, on the same clock as HostRecord.
-        std::int64_t hostIssueNs;  // cpu time spent in scope
+        std::int64_t hostIssueNs;  // CPU time spent in the scope.
     };
 
     // The open end of a stage chain on one stream.
@@ -44,8 +42,8 @@ namespace cadence {
         cudaStream_t stream;
         cudaEvent_t tail;
         std::uint64_t generation;
-        int device;                        // Device the tail was created on; a change breaks the chain rather than pairing events across devices.
-        // Sampling is decided once per chain rather than once per stage: a chain whose middle links are missing does not measure the stages that remain, it measures them plus the gaps where the skipped ones used to be.
+        int device;  // Device that owns the tail event.
+        // Make one sampling decision for the complete chain.
         std::uint64_t sampleGeneration;
         bool sampled;
     };
@@ -57,7 +55,7 @@ namespace cadence {
     };
 #endif
 
-    // Grown once, then reused. A reallocation in the middle of a control loop shows up as jitter in the very measurement it is taken to support.
+    // Reserve hot-path storage to avoid steady-state allocations.
     inline constexpr std::size_t NUM_RECORDS_RESERVED = 256;
     inline constexpr std::size_t NUM_EVENTS_PER_REFILL = 64;
 
@@ -72,17 +70,17 @@ namespace cadence {
         ThreadState(const ThreadState&) = delete;
         ThreadState& operator=(const ThreadState&) = delete;
 
-        // Guards the pending vectors only
+        // Guards pending record vectors only.
         std::mutex mutex;
         std::vector<HostRecord> pendingHost;
         bool retired = false;
 
 #if CADENCE_HAS_CUDA
         std::vector<DeviceRecord> pendingDevice;
-        std::vector<EventCache> eventCaches; // touched by owning thread
+        std::vector<EventCache> eventCaches;  // Accessed by the owning thread.
         std::vector<StreamChain> chains;
 
-        // Both lists hold one entry per device or stream this thread has actually touched, which in practice is one or two, so a scan beats a hash lookup on the hot path.
+        // Device and stream counts are small enough for linear lookup.
         std::vector<cudaEvent_t>& CacheFor(int device) {
             for (EventCache& cache : eventCaches) {
                 if (cache.device == device) return cache.events;

@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(cadence VERSION 0.2.0 LANGUAGES CXX)
+project(cadence VERSION 0.2.0 DESCRIPTION "In-process CUDA loop timing" LANGUAGES CXX)
 
-# cadence is header-only. A consumer needs the include path and C++17 -- no
-# compiled objects, no CUDA language enabled here, nothing to configure. That
-# is the whole build.
+# Consumers need only the headers, C++17, and the thread library. CUDA is not
+# enabled for the interface target.
 add_library(cadence INTERFACE)
 add_library(cadence::cadence ALIAS cadence)
 
@@ -15,9 +14,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(cadence INTERFACE Threads::Threads)
 
 # --- Developer tree -----------------------------------------------------------
-# Tests, examples and benchmarks build only when cadence is the project being
-# built. Someone who does add_subdirectory(cadence) in their own tree gets the
-# headers and nothing else, which is the whole point of a header-only library.
+# Build developer targets by default only when cadence is the top-level project.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(CADENCE_IS_TOP_LEVEL ON)
 else()
@@ -28,9 +25,8 @@ option(CADENCE_BUILD_TESTS "Build cadence tests" ${CADENCE_IS_TOP_LEVEL})
 option(CADENCE_BUILD_EXAMPLES "Build cadence examples" ${CADENCE_IS_TOP_LEVEL})
 option(CADENCE_BUILD_BENCHMARKS "Build cadence benchmarks" ${CADENCE_IS_TOP_LEVEL})
 
-# The host tests, and everything CUDA-free, build anywhere. The device tests and
-# examples need nvcc; point CMake at one with -DCMAKE_CUDA_COMPILER=... or the
-# CUDACXX environment variable.
+# Device tests and examples require nvcc. Select it with
+# -DCMAKE_CUDA_COMPILER=... or the CUDACXX environment variable.
 if(CADENCE_BUILD_TESTS OR CADENCE_BUILD_EXAMPLES OR CADENCE_BUILD_BENCHMARKS)
   include(CheckLanguage)
   check_language(CUDA)
@@ -78,8 +74,8 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion
   ARCH_INDEPENDENT)
 
-# find_package(cadence) has to pull in Threads itself: the exported target
-# depends on it, and an imported target cannot carry that dependency for you.
+# The installed package resolves the Threads dependency used by the exported
+# interface target.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cadenceConfig.cmake"
 "include(CMakeFindDependencyMacro)\n\
 find_dependency(Threads)\n\

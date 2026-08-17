@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Render ANSI-coloured terminal text as a self-contained SVG card.
+"""Render ANSI-colored terminal text as a self-contained SVG card.
 
-Regenerates the report image in the README, so that it stays a picture of what
-the library actually prints rather than a screenshot that drifts:
+Regenerates the README image directly from report output:
 
     CADENCE_BUDGET_MS=0.071 CADENCE_COLOR=1 ./build/examples/cadence_example_loop > run.txt
     python3 docs/render_report_svg.py run.txt docs/report.svg "cadence report"
@@ -11,7 +10,9 @@ Standard library only. Runs are emitted as adjacent tspans with no explicit x,
 so columns line up in whatever monospace font the reader has; textLength then
 pins each line to the width the card was sized against.
 """
-import re, sys, html
+import html
+import re
+import sys
 
 PALETTE = {
     "fg":     "#c9d1de",
@@ -84,11 +85,11 @@ def main(src, dst, title):
         length = len(text) * ADVANCE
         spans = []
         # Runs are emitted back to back with no explicit x, so columns stay aligned
-        # in whichever monospace font the reader actually has; textLength then pins
+        # in the selected monospace font; textLength then pins
         # the whole line to the width the layout above was computed against.
-        lineRuns = runs(line)
-        for index, (chunk, fill, weight) in enumerate(lineRuns):
-            if index == len(lineRuns) - 1:
+        line_runs = runs(line)
+        for index, (chunk, fill, weight) in enumerate(line_runs):
+            if index == len(line_runs) - 1:
                 chunk = chunk.rstrip()   # trailing spaces would stretch textLength
             if not chunk:
                 continue

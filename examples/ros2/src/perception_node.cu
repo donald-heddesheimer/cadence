@@ -1,10 +1,4 @@
-// A ROS 2 node whose timer callback runs a small CUDA pipeline, instrumented with cadence.
-//
-// The question a ROS 2 developer actually has about a perception callback is not "how long does it take on average" but "is it holding its rate, and when it does not, which stage was it". A topic carrying one latency number per callback answers neither: it tells you the callback was slow without telling you where the time went, and by the time you plot it the run is over.
-//
-// So this node does both. It publishes its own end-to-end latency on ~/latency_ms, which is what you would write anyway, and it wraps each stage in a cadence scope. The deadline is set to the timer period, so the report's verdict is the question the node exists to answer: did this callback hold its rate. When it did not, the slowest-iteration breakdown says which stage cost the time.
-//
-// Nothing here is synthetic-slowdown theatre. At the default period the pipeline fits comfortably; drop the period or raise the workload and the misses are real ones caused by real work.
+// A ROS 2 timer callback instrumented for end-to-end and per-stage CUDA latency.
 
 #include <cadence/cadence.h>
 
@@ -22,14 +16,14 @@
 
 namespace {
 
-    // Three stages standing in for a perception pipeline. They are arithmetic rather than a real detector, but they are real GPU work with real launch costs, which is what the instrumentation is being shown against.
+    // Three arithmetic stages model the launch and execution shape of a pipeline.
     __global__ void Normalize(float* data, int numElements, float scale, float bias) {
         const int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index >= numElements) return;
         data[index] = fmaf(data[index], scale, bias);
     }
 
-    // The heavy stage, and the one whose cost moves when the workload parameter changes.
+    // This stage scales with the configurable workload.
     __global__ void Detect(const float* data, float* scores, int numElements, int numTaps) {
         const int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index >= numElements) return;
@@ -56,15 +50,15 @@ namespace {
     class PerceptionNode : public rclcpp::Node {
        public:
         PerceptionNode() : Node("cadence_perception") {
-            // Defaults chosen so the pipeline uses a visible fraction of its period rather than a rounding error of it. A demo whose deadline bar sits at 2% teaches nothing: the interesting output is a loop that is comfortably meeting a rate you can then take away from it.
+            // Defaults keep the workload below, but close enough to, its deadline.
             periodMs_ = declare_parameter<double>("period_ms", 5.0);
             numElements_ = static_cast<int>(declare_parameter<int>("num_elements", 1 << 20));
             numTaps_ = static_cast<int>(declare_parameter<int>("num_taps", 384));
 
-            // The deadline is the timer period, which is what makes the report's verdict answer the node's actual question rather than a generic one. No budgetLabel is named: the sole label that records host time and launches nothing is the CADENCE_SCOPE around the callback, and cadence resolves the budget to it on its own.
+            // Apply the timer period to the automatically selected callback scope.
             cadence::Config config;
             config.budgetMs = periodMs_;
-            // The first callbacks pay for context creation and module loading, which have nothing to do with whether the loop holds its rate.
+            // Exclude context creation and module loading from steady-state results.
             config.warmupIterations = 10;
             config.numWorstIterations = 3;
             config.tracePath = "cadence_perception.json";
@@ -102,7 +96,7 @@ namespace {
         void OnTimer() {
             const auto began = std::chrono::steady_clock::now();
             {
-                // The loop span. Everything below is inside it, so the deadline is held against the whole callback rather than against any one stage.
+                // Measure the complete callback for deadline evaluation.
                 CADENCE_SCOPE("callback");
 
                 const int numBlocks = NumBlocksFor(numElements_);
@@ -119,7 +113,7 @@ namespace {
                     Threshold<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream_>>>(scores_, output_, numElements_, 0.5f);
                 }
 
-                // The boundary this callback was going to synchronize on anyway, which is exactly where cadence wants its flush: the records resolve against work that has already finished, so nothing is waited on twice.
+                // Resolve records at the callback's existing synchronization boundary.
                 cudaStreamSynchronize(stream_);
                 CADENCE_FLUSH();
             }
@@ -151,7 +145,7 @@ int main(int argc, char** argv) {
         rclcpp::spin(node);
     }
     rclcpp::shutdown();
-    // Explicit, and after the node is gone, so the report is taken while the CUDA runtime is certainly still alive rather than during static destruction.
+    // Report before CUDA runtime teardown.
     CADENCE_REPORT();
     return 0;
 }

@@ -1,17 +1,14 @@
 # cadence in a ROS 2 node
 
 A timer-driven node whose callback runs a three-stage CUDA pipeline. It publishes
-its own end-to-end latency on `~/latency_ms`, which is what you would write
-anyway, and wraps each stage in a cadence scope, which is what the topic cannot
-tell you.
+end-to-end latency on `~/latency_ms` and uses cadence scopes to attribute that
+latency to individual stages.
 
-The deadline is set to the timer period, so the report's verdict answers the
-question the node exists to answer: **is this callback holding its rate**, and
-when it is not, which stage cost the time.
+The deadline matches the timer period, so the report shows whether the callback
+maintains its requested rate and identifies the stages behind missed deadlines.
 
-This package is deliberately outside the cadence build and outside cadence's CI.
-A GitHub runner has no ROS 2, and a header-only library should not make every
-consumer care about a dependency they do not have.
+This package remains outside the main cadence build and CI so ROS 2 is not a
+dependency of the header-only library.
 
 ## Build
 
@@ -62,27 +59,16 @@ Eight seconds at the defaults on an RTX A4000:
     #269    5.99ms  normalize 5.98ms · detect 1.69ms · threshold 25.6µs
 ```
 
-That run is the whole argument for instrumenting a callback rather than plotting
-its latency.
+The p95 is 2.01ms against a 5ms deadline, and 1571 of 1572 callbacks complete
+inside budget. The mean latency topic alone would report 1.95ms.
 
-The node is healthy: p95 is 2.01ms against a 5ms deadline, 40% of budget, and
-1571 of 1572 callbacks held their rate. A dashboard averaging `~/latency_ms`
-would show 1.95ms and nothing else.
-
-And then **iteration #269 spent 5.98ms in `normalize`**, a stage whose median is
-27.6µs — 220 times its normal cost, on a kernel that does one multiply-add per
-element. The following callback, #270, took 7.80ms with every stage at its normal
-duration, so that one was blocked before it ever reached the GPU. Two consecutive
-missed frames, one caused by the GPU and one not, and the report tells them apart.
-
-That is the distinction the topic cannot make. `~/latency_ms` would show two
-spikes; it could not say that the first was a stalled kernel and the second was
-not, and no column of averages would say either.
+The stage breakdown adds the missing context. Iteration #269 spends 5.98ms in
+`normalize`, whose median is 27.6µs. Iteration #270 takes 7.80ms while each GPU
+stage remains near its usual duration, indicating delay outside GPU execution.
 
 ## Taking the rate away from it
 
-The interesting demonstration is a loop you make fail. Drop the period until the
-work stops fitting:
+Reduce the period until the workload no longer fits:
 
 ```sh
 ros2 run cadence_ros2_example perception_node --ros-args -p period_ms:=2.0
@@ -94,10 +80,9 @@ ros2 run cadence_ros2_example perception_node --ros-args -p period_ms:=2.0
             [████████████████████████████████████████]  p95 2.00ms at 100%
 ```
 
-92% of callbacks held the rate and the p95 sits exactly on the deadline. Nothing
-is broken, nothing throws, and a mean of 1.98ms against a 2.00ms budget looks
-fine — which is precisely why the verdict is a count of misses rather than an
-average of overshoot.
+Here 92% of callbacks complete inside budget and p95 reaches the deadline. The
+1.98ms mean remains below the 2.00ms budget, demonstrating why the report counts
+individual misses.
 
 ## Notes
 

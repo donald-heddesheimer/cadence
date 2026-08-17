@@ -13,7 +13,7 @@ Every number below is the best difference over 7 x 50,000 scopes on an RTX A4000
 
 ## The correctness guards
 
-About 200 ns of every device scope buys two things that cannot be skipped:
+About 200 ns of each device scope covers two correctness checks:
 
 - `cudaStreamIsCapturing`, at 39.5 ns per call and called on both ends of a
   scope, which keeps cadence from recording into a stream capturing a CUDA
@@ -25,18 +25,17 @@ About 200 ns of every device scope buys two things that cannot be skipped:
   another device's stream nor `cudaEventElapsedTime` across a device boundary is
   legal.
 
-Measured against the same benchmark before the guards existed, the cost is +160
-to +230 ns per device scope depending on the run, or roughly 5 to 7%. Both
-failures they prevent are silent, which is why neither is configurable.
+Measured against the same benchmark before the guards existed, the cost is 160
+to 230 ns per device scope, or approximately 5 to 7%. Neither check is
+configurable because both prevent silent failures.
 `CADENCE_SCOPE` touches no CUDA and pays neither.
 
 ## Against the hand-rolled version
 
-The alternative cadence is usually weighed against is not another tool, it is
-twenty lines someone writes inline: record either side of the launch, block on
-the stop event, read the elapsed time out. Measured the same interleaved way,
-with the events created once outside the loop rather than per scope, which is the
-charitable version of that code:
+The comparison below uses a blocking inline implementation: record events around
+the launch, wait on the stop event, and query the elapsed time. Events are
+created once outside the loop, and measurements use the same interleaved method
+as the cadence benchmark.
 
 | | ns/scope | vs `CADENCE_KERNEL` |
 |---|---:|---:|
@@ -51,22 +50,15 @@ And on the whole loop, 50,000 launches against the same uninstrumented baseline:
 | `CADENCE_KERNEL` | 320 ms | 2.7x |
 | hand-rolled | 443 ms | 3.7x |
 
-Two things in here are worth stating plainly because the first one is not what
-was expected.
-
 **The hand-rolled cost does not scale with kernel duration.** The obvious
-prediction is that blocking on a 17 µs kernel costs 17 µs, and it does not: the
-figure moves from 6470 to 6970 ns, near enough flat. What a blocking read buys is
-a fixed round trip to the driver and back, not a wait proportional to the work,
-because the baseline it is measured against is already waiting for the same
-kernel.
+prediction is that blocking on a 17 µs kernel adds 17 µs. Instead, the measured
+cost moves from 6470 to 6970 ns. The baseline already waits for the kernel, so
+the difference primarily reflects a fixed driver round trip.
 
-**The gap widens over real work anyway, for the opposite reason.** cadence gets
-*cheaper* over a longer kernel -- 3390 ns against a trivial one, 3090 ns against
-the 17 µs one -- because its two records go out while the GPU already has work in
-flight. The blocking version cannot do that by construction. So the ratio moves
-from 1.8x to 2.3x as the kernels get more realistic, which is the opposite of the
-direction a reader would guess.
+**The gap widens with longer work.** cadence measures 3390 ns against a trivial
+kernel and 3090 ns against the 17 µs kernel because event records overlap work
+already in flight. The blocking implementation cannot preserve that overlap, so
+its relative cost moves from 1.8x to 2.3x.
 
 These figures were taken on unpinned clocks, so read the ratios rather than the
 absolutes; each ratio comes from a single interleaved run and reproduces to
@@ -82,12 +74,10 @@ separate measurements say so:
 - It does not change with launch-queue depth. Zero, one, four, and sixteen pending launches make no difference.
 - It drops to 153 ns with `cudaEventDisableTiming`. The remaining 1250 ns or so is the timestamp itself, not the ioctl.
 
-Two of those records account for about 72% of a device scope. The rest of what
-cadence does, meaning the event pool, the record append, and the flush, adds up
-to a few percent, and has been optimized far enough that further work there is
-not worth the complexity. For scale, on the same machine an uncontended mutex is
-18 ns, `cudaEventSynchronize` on an already-complete event is 142 ns, and
-`cudaEventElapsedTime` is 249 ns.
+Two records account for about 72% of a device scope. The event pool, record
+append, and flush contribute only a few percent. For comparison, the same
+machine measures an uncontended mutex at 18 ns, `cudaEventSynchronize` on an
+already-complete event at 142 ns, and `cudaEventElapsedTime` at 249 ns.
 
 So the only real lever is recording fewer events. That is what the two opt-in
 modes below do, and neither is free.
@@ -114,7 +104,7 @@ its neighbours.
 
 Two device tests pin the trade-off in both directions,
 `TestChainingChargesGapsToTheNextStage` and `TestPairedScopeIgnoresGaps`, so the
-behaviour cannot drift silently.
+behavior cannot drift silently.
 
 On a realistic 5-stage, 20 µs-per-stage loop, chaining measured 34% less total
 instrumentation cost than the paired path.
@@ -168,11 +158,10 @@ micro-optimization.
 
 ## Reproducing these numbers
 
-The methodology matters more than it looks. Measuring the baseline and the
-instrumented loop in separate phases lets GPU clocks drift between them, which
-produced 2x swings from run to run. The benchmark instead interleaves both
-inside each repeat and takes the minimum of the differences, which reproduces to
-within about 1%.
+Measuring the baseline and instrumented loop in separate phases allows GPU clock
+drift and produced 2x swings between runs. The benchmark therefore interleaves
+both inside each repeat and takes the minimum difference, reproducing within
+about 1%.
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release

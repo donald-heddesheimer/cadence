@@ -10,7 +10,7 @@
 #include <vector>
 
 namespace cadence {
-    // Bins in the distribution column of the terminal report. Twelve is a compromise: wide enough that a bimodal label looks bimodal rather than merely wide, narrow enough that the column still fits beside the numbers on an 80-column terminal.
+    // Histogram width used by the terminal report.
     inline constexpr std::size_t NUM_HISTOGRAM_BINS = 12;
 
     enum class ScopeKind {
@@ -25,7 +25,7 @@ namespace cadence {
     struct Stats {
         std::string label;
         ScopeKind kind = ScopeKind::Device;
-        // Which GPU produced this row, or -1 for a row that belongs to no device: a plain CADENCE_SCOPE, or statistics computed from samples cadence did not gather. A process driving several GPUs gets one row per device per label, because the reason to look at two cards is that one of them is slower and an average of the two says nothing about either.
+        // Producing GPU, or -1 for host-only and externally supplied samples.
         int device = -1;
         std::size_t count = 0;      // Samples kept, i.e. after warmup discard.
         std::size_t discarded = 0;  // Samples dropped as warmup.
@@ -35,23 +35,22 @@ namespace cadence {
         double p95Ms = 0.0;
         double maxMs = 0.0;
         double stddevMs = 0.0;
-        // Jitter: max - min over the kept samples. For a control loop this is the number that decides whether a deadline holds, not the mean.
+        // Range of retained samples: max - min.
         double jitterMs = 0.0;
-        // Sample counts in NUM_HISTOGRAM_BINS equal-width bins spanning min to max. A summary row cannot show that a label is bimodal; this can, and it is the one thing in the report that makes a stall visible rather than merely averaged in. Fixed-width so Stats stays cheap to copy.
+        // Counts in equal-width bins spanning min to max.
         std::array<std::uint32_t, NUM_HISTOGRAM_BINS> histogram{};
 
         // The deadline this row is held to, and how often it was missed. Zero means no budget applies here, which is the case for every row but the one the budget names.
         double budgetMs = 0.0;
         std::size_t overBudget = 0;
 
-        // True when the run outlived the sample reservoir, so more observations were made than were kept. count, mean, stddev, min, max and overBudget stay exact either way; only the percentiles and the histogram become estimates drawn from a uniform sample of the run.
+        // True when percentiles and histogram are reservoir estimates. Aggregate
+        // fields and overBudget remain exact.
         bool estimated = false;
     };
 
     namespace detail {
-    // A bounded, uniformly-sampled view of one label's observations, alongside the aggregates that can be maintained exactly in constant space.
-    //
-    // Everything a deadline is judged on is exact: the count, the extremes, the mean and standard deviation via Welford, and the number of observations over budget. Only the order statistics need the samples themselves, and those come from a reservoir (Vitter's Algorithm R), which holds a uniform sample of the whole run rather than the most recent window. That distinction matters for a profiler: a ring buffer would quietly answer "what did the last few seconds look like" to a question that asked about the run.
+    // Uniform reservoir sample with exact constant-space aggregates.
     struct SampleSet {
         std::vector<double> reservoir;
         std::uint64_t count = 0;  // Observations kept for statistics; the reservoir holds at most NUM_SAMPLES_RETAINED of them.
@@ -105,7 +104,7 @@ namespace cadence {
         return sorted[std::min(index, sorted.size() - 1)];
     }
 
-    // The exact aggregates come straight off the set; only the percentiles and the histogram are read from the reservoir, which is sorted in place to do it. Named apart from the vector form below rather than overloaded against it, because a braced list of samples would otherwise match both.
+    // Compute exact aggregates plus reservoir-based percentiles and histogram.
     inline Stats ComputeStatsFromSet(const std::string& label, ScopeKind kind, SampleSet samples, std::size_t discarded, double budgetMs = 0.0) {
         Stats stats;
         stats.label = label;
@@ -139,7 +138,7 @@ namespace cadence {
             }
             ++stats.histogram[bin];
         }
-        // The extremes are exact but the reservoir need not have kept them, and the outlier bin is the entire reason this column exists: a lone mark far to the right is how a stall becomes visible rather than averaged in. The minimum and the maximum did occur, so their bins hold at least one observation whether or not the sample retained the evidence.
+        // Preserve bins for exact extrema even when the reservoir omitted them.
         if (span > 0.0) {
             if (stats.histogram[0] == 0) stats.histogram[0] = 1;
             if (stats.histogram[NUM_HISTOGRAM_BINS - 1] == 0) stats.histogram[NUM_HISTOGRAM_BINS - 1] = 1;

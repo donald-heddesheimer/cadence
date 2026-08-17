@@ -2,29 +2,21 @@ BasedOnStyle: Google
 Language: Cpp
 Standard: c++17
 
-# Four spaces per level, never tabs.
+# Four spaces, no tabs.
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
 
-# Nothing wraps automatically. ColumnLimit 0 tells clang-format to keep the line
-# breaks the author wrote, for code and for prose alike, so an explanation or a
-# printf argument list can be one long line instead of an artificially chopped
-# paragraph. ReflowComments is redundant at that point but stays for clarity.
+# Preserve manually chosen line breaks.
 ColumnLimit: 0
 ReflowComments: false
 
-# Namespace bodies are indented, with one deliberate exception this file cannot
-# express: only the outermost namespace is indented by hand, so the body of a
-# nested `namespace detail` stays level with its opening brace. clang-format has
-# no setting for that -- All indents every level, None indents none -- so
-# namespace indentation in this repo is maintained by hand and clang-format is
-# not run over the tree in CI. Format a file by eye, not with -i.
+# Namespace indentation is maintained manually because nested `detail`
+# namespaces intentionally remain aligned with their opening declaration.
 NamespaceIndentation: All
 
 DerivePointerAlignment: false
 PointerAlignment: Left
-# This library is mostly one-line forwarders (`inline void Flush() { ... }`);
-# keeping them on one line is the point of them.
+# Keep small forwarding functions on one line.
 AllowShortFunctionsOnASingleLine: All
 IndentPPDirectives: None

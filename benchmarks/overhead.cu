@@ -55,7 +55,7 @@ namespace {
         return best;
     }
 
-    // The hand-rolled version, written the way it is usually written: record either side of the launch, then block until the stop event completes and read the elapsed time out. Events are created once outside the loop rather than per scope, which is the charitable version of this code.
+    // Blocking comparison with events allocated once outside the loop.
     struct NaiveTimer {
         cudaEvent_t start = nullptr;
         cudaEvent_t stop = nullptr;
@@ -222,7 +222,7 @@ int main() {
 
     // The same comparison over a kernel with a real duration, because the trivial kernel above flatters the blocking approach: it is cheap to wait for something that takes no time.
     //
-    // What this measures is not what it was expected to. The hand-rolled cost does not scale with kernel duration -- it stays near 7 us either way, because what it buys is a fixed round trip, not a wait proportional to the work. The gap widens anyway, and for the opposite reason: cadence gets *cheaper* over a longer kernel, since its two records go out while the GPU already has work to do, whereas the blocking version gives up that overlap by construction.
+    // Compare deferred and blocking measurement over nontrivial GPU work.
     constexpr long long SPIN_CYCLES = 31200;  // ~20 us at the A4000's 1.56 GHz boost clock.
     const auto spinOnly = [&] {
         for (int chunk = 0; chunk < NUM_SPIN_CHUNKS; ++chunk) {

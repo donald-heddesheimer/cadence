@@ -1,15 +1,12 @@
 # Case study: instrumenting llama.cpp's CUDA backend
 
-Everything else in this repository is measured against a benchmark written to be
-measured. This is cadence pointed at code it did not grow up with: llama.cpp's
-CUDA backend, unmodified except for the instrumentation, running a real model.
+This study applies cadence to llama.cpp's CUDA backend while it runs a real
+model. Unlike the repository's controlled benchmarks, llama.cpp uses CUDA graph
+capture, kernel fusion, and a graph executor rather than a loop of named stages.
 
-The point was to find out what happens when the library meets a codebase with its
-own ideas — CUDA graph capture, kernel fusion, a graph executor rather than a
-loop of named stages. Three things came out of it. One validates a number this
-repository has been publishing. One is a fact about llama.cpp. One is a defect in
-cadence that produces a confidently wrong conclusion, and it is written up here
-in full because a case study that only finds good news is not worth reading.
+The results independently validate cadence's measured overhead, quantify the
+cost of instrumenting at the wrong granularity, and expose three reporting
+defects that were subsequently fixed and covered by regression tests.
 
 ## Setup
 
@@ -23,10 +20,10 @@ in full because a case study that only finds good news is not worth reading.
 The patch adds three things to `ggml/src/ggml-cuda/ggml-cuda.cu` and nothing
 else: a host scope around `ggml_backend_cuda_graph_compute`, a device scope
 around `cudaGraphLaunch`, and — in one mode — a device scope per graph node
-labelled by `ggml_op_name(node->op)`. The mode is chosen at runtime by
+labeled by `ggml_op_name(node->op)`. The mode is chosen at runtime by
 `CADENCE_LLAMA_MODE`, so the same binary produces every row below.
 
-## What the report says
+## Graph-level results
 
 Instrumenting only at the graph level, with llama.cpp's CUDA graphs on:
 
@@ -38,20 +35,17 @@ Instrumenting only at the graph level, with llama.cpp's CUDA graphs on:
   cuda-graph     host    367  7.17µs  7.06µs  7.83µs  11.2µs  4.57µs  █▇▄▂▂▂▂    ▂
 ```
 
-Two things are worth reading off it.
-
 **The GPU measurement independently reproduces llama.cpp's own throughput.**
 `cuda-graph` device mean is 3.93 ms; llama-bench reported 248.3 tok/s on the same
 run, which is 4.03 ms per token. cadence is measuring the same thing llama.cpp is
 measuring, from the other side, and the two agree to within the ~100 µs the host
 spends outside the graph.
 
-**Decode is 99.8% GPU.** The CPU spends 8.30 µs per token issuing a 3.93 ms graph.
-That is the `device` and `host` row pair doing exactly what the README says they
-are for: when they diverge this far, the loop is compute-bound and no amount of
-CPU-side work will help it.
+**Decode is 99.8% GPU time.** The CPU spends 8.30 µs per token issuing a
+3.93 ms graph. The difference between the `device` and `host` rows identifies
+the loop as compute-bound.
 
-## The capture guard fires, on somebody else's code
+## CUDA graph capture behavior
 
 llama.cpp captures its decode graph with `cudaStreamBeginCapture` and replays it
 with `cudaGraphLaunch`. cadence documents that it refuses to record into a
@@ -62,13 +56,12 @@ flush landing before the capture closes invalidates the capture outright.
 With per-node instrumentation on, the report opens with:
 
 ```
-  WARNING   535 scope(s) skipped -- their stream was capturing into a CUDA graph,
-            which cannot carry timing events; wrap the graph launch instead
+  WARNING   535 scopes skipped during CUDA graph capture;
+            instrument the graph launch instead
 ```
 
-This is the guard working as designed against real third-party code that really
-does use CUDA graphs, and the advice in that message — *wrap the graph launch
-instead* — is exactly what the `cuda-graph` row above is.
+The guard correctly skips scopes recorded during graph capture. Instrumenting
+the graph launch instead produces the `cuda-graph` row above.
 
 There is a second, quieter consequence, and the `n` column is the only place it
 shows up. Over 367 decodes, the per-node rows report `n` between 88 and 176.
@@ -78,13 +71,12 @@ llama.cpp measures the handful of pre-capture evaluations and then goes quiet,
 while the counts stay honest enough to say so. A tool that reported a mean
 without a count would have looked entirely healthy.
 
-## The measurement that caught my own mistake
+## Validating instrumentation coverage
 
 With CUDA graphs disabled (`GGML_CUDA_DISABLE_GRAPHS=1`), per-node scopes run on
-every decode and the per-op distribution becomes real. The first version of that
-patch put the scope around `ggml_cuda_compute_forward`, which is the obvious line.
-The report then claimed 381 µs of device work per iteration against a
-`graph-compute` host span of 2.16 ms — most of the GPU time was unaccounted for.
+every decode. The initial instrumentation wrapped
+`ggml_cuda_compute_forward`, but the report accounted for only 381 µs of device
+work within a 2.16 ms `graph-compute` host span.
 
 The cause is in the loop above it:
 
@@ -96,9 +88,8 @@ if (nodes_to_skip != 0) {
 }
 ```
 
-A fused group launches its work inside `ggml_cuda_try_fuse` and then `continue`s
-straight past `ggml_cuda_compute_forward`. A scope on the obvious line sees none
-of it. Moving the scope to cover both calls:
+A fused group launches inside `ggml_cuda_try_fuse` and then skips
+`ggml_cuda_compute_forward`. Moving the scope to cover both calls produced:
 
 | op | scopes, obvious placement | scopes, fusion covered |
 |---|---:|---:|
@@ -108,13 +99,11 @@ of it. Moving the scope to cover both calls:
 | everything else | 23,511 | 23,511 |
 | **total** | **35,909** | **133,257** |
 
-The first placement missed 97.7% of the matrix multiplies and every single
-`RMS_NORM` — an entire op type that simply was not in the report. The lesson is
-not about cadence; it is that instrumenting somebody else's graph executor at the
-line that looks right will quietly miss its fast path, and the only defence is
-checking whether the parts add up to the whole.
+The initial placement missed 97.7% of matrix multiplies and every `RMS_NORM`.
+Instrumentation around a graph executor must cover fused fast paths, and its
+component totals should be checked against the enclosing operation.
 
-## The overhead number holds up outside its own benchmark
+## Overhead cross-check
 
 [docs/overhead.md](overhead.md) publishes 3390 ns per `CADENCE_KERNEL` scope from
 a synthetic benchmark. llama.cpp offers a way to check that against real work: run
@@ -127,16 +116,13 @@ llama-bench.
 | per-op, obvious placement | 212.94 | 4.696 | 97 | **3227** |
 | per-op, fusion covered | 182.43 | 5.482 | 361 | **3044** |
 
-Two measurements, taken at scope counts that differ by 3.7x, on somebody else's
-kernels, land within 10% of the published figure and within 6% of each other.
-That is about as good as an unpinned-clock cross-check gets, and it is the first
-evidence in this repository that the number means anything outside the benchmark
-that produced it.
+The two measurements use scope counts that differ by 3.7x, yet remain within
+10% of the published figure and within 6% of each other. This is consistent with
+the synthetic benchmark despite unpinned clocks and a different workload.
 
-It also settles the README's advice with a real example. "Wrap stages, not
-individual small kernels" costs 20.1% of throughput here when taken literally at
-361 scopes per token — while the graph-level instrumentation, three scopes per
-token, is free:
+The results also quantify instrumentation granularity. At 361 scopes per token,
+per-operation instrumentation reduces throughput by 20.1%. Graph-level
+instrumentation uses three scopes per token and shows no measurable cost:
 
 | configuration | tok/s | vs its own baseline |
 |---|---:|---:|
@@ -147,41 +133,39 @@ token, is free:
 | graph-level scopes, graphs off | 228.05 | −0.1% |
 | per-op scopes, graphs off | 182.43 | **−20.1%** |
 
-(Incidentally: CUDA graphs are worth 8.4% to llama.cpp on this model, 247.41
-against 228.20 tok/s. Not a cadence result, but it fell out of the same runs.)
+For context, CUDA graphs improve llama.cpp throughput by 8.4% on this model
+(247.41 versus 228.20 tok/s). This is a workload result, not a cadence result.
 
-## Three defects this turned up in cadence
+## Defects identified and fixed
 
-None of these are visible on a loop with a handful of stages, which is the only
-shape the tests and benchmarks had ever covered. All three are described below as
-they were found, and all three are now fixed — each with a regression test that
-was checked to fail with its own fix reverted.
+The graph workload exposed three cases not covered by the original small-stage
+tests. Each defect is fixed and has a regression test verified against the
+pre-fix behavior.
 
-**1. The summary line states a conclusion that is the opposite of the truth.**
+**1. The summary did not account for repeated labels.**
 On the per-op run the report ends:
 
 ```
-  device    205µs across 8 label(s)
+  device    205µs across 8 labels
   graph-compute  2.82ms, of which 7.3% is GPU work; 2.61ms is launch and synchronization
 ```
 
 The workload is 99.8% GPU-bound. `WriteSummary` adds one mean per label, which is
 correct only when each label occurs once per iteration; here `MUL_MAT` occurs 178
-times per token. Weighting each mean by its actual occurrence rate gives 5.4 ms of
-device work per iteration, not 205 µs. The line is not merely imprecise — it
-confidently reports the single most important fact about this workload backwards.
+times per token. Weighting each mean by its occurrence rate gives 5.4 ms of
+device work per iteration instead of 205 µs, reversing the classification.
 
 *Fixed:* each mean is now weighted by `count / iterations`. The denominator is the
 observation count of the single pure-host label, which is the loop body and ran
 once per pass by construction. Without one there is no denominator, so the sum of
-the means is now labelled as exactly that and the conclusion is withheld.
+the means is now labeled as exactly that and the conclusion is withheld.
 
-**2. The worst-iteration breakdown is unbounded.** With ~250 spans in an
-iteration, `WriteWorstIterations` prints all of them on one line: a single
-unreadable paragraph several thousand characters long, three times over.
+**2. The worst-iteration breakdown was unbounded.** With approximately 250 spans
+per iteration, `WriteWorstIterations` produced lines several thousand characters
+long.
 
-*Fixed:* spans are folded by label — `MUL_MAT 3.10ms x178`, which is the number
-worth reading anyway — sorted widest first, and cut to eight with a `+N more`.
+*Fixed:* spans are folded by label — for example, `MUL_MAT 3.10ms x178` — sorted
+widest first, and limited to eight entries with a `+N more` suffix.
 Folding before cutting is what makes the cut useful; cutting 250 raw spans to
 eight prints eight matrix multiplies.
 
@@ -197,7 +181,7 @@ worst GPU iteration (4.04 ms) never appeared.
 device time is larger. Where the loop scope does enclose its GPU work it is the
 larger of the two by construction, so the ordinary case is unchanged.
 
-## One thing that is not a defect, but caught me anyway
+## Dynamic labels
 
 `CADENCE_KERNEL` resolves its label through a function-local `static`, so the
 handle is interned once per *call site*, not once per execution. Passing a label
@@ -211,15 +195,12 @@ class directly:
 cadence::ScopedKernel scope(ggml_op_name(node->op), cuda_ctx->stream());
 ```
 
-Documented, and still the first thing I got wrong. Worth knowing before you reach
-for a dynamic label.
+Use the class directly whenever a label changes between executions.
 
 ## Reproducing
 
-The patch is a script rather than a diff so it survives llama.cpp moving lines
-around, and so it is obvious what was inserted where. It is not in this
-repository — llama.cpp is not a dependency of cadence and should not become one —
-but it is four insertions, all quoted above.
+The instrumentation patch is kept outside this repository because llama.cpp is
+not a cadence dependency. It consists of the four insertions described above.
 
 ```sh
 git clone --depth 1 https://github.com/ggml-org/llama.cpp

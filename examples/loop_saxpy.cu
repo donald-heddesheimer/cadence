@@ -1,4 +1,4 @@
-// cadence example: a control-loop shaped workload.
+// A control-loop-shaped CUDA workload instrumented with cadence.
 //
 // Build:
 //   export CUDACXX=/usr/local/cuda-12.9/bin/nvcc
@@ -18,13 +18,13 @@ namespace {
     constexpr int NUM_ITERATIONS = 200;
     constexpr int NUM_THREADS_PER_BLOCK = 256;
 
-    // basic parallelized y = ax + b
+    // Compute y = ax + b in parallel.
     __global__ void Saxpy(float alpha, const float* x, float* y, int numElements) {
         const int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index < numElements) y[index] = alpha * x[index] + y[index];
     }
 
-    // mults resulting array by scalar
+    // Scale the resulting array.
     __global__ void Scale(float factor, float* y, int numElements) {
         const int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index < numElements) y[index] *= factor;
@@ -41,9 +41,9 @@ namespace {
 int main() {
     cadence::Config config;
     config.warmupIterations = 10;  // Discard context creation and autotuning.
-    // A loop that has to close at 12.5 kHz. With no label named, the budget lands on the one scope that never launched a kernel, which is the "iteration" span below.
+    // Hold the complete iteration to a 12.5 kHz deadline.
     config.budgetMs = 0.080;
-    // The slowest iterations get written out as a timeline. Open it at https://ui.perfetto.dev to see the launches on the host lane and the kernels they queued on the device lane.
+    // Export retained slow iterations for inspection in Perfetto.
     config.tracePath = "worst.json";
     cadence::Configure(config);
 
@@ -78,7 +78,7 @@ int main() {
             cudaStreamSynchronize(stream);
         }
 
-        // Flush once per iteration
+        // Resolve the iteration after its synchronization boundary.
         CADENCE_FLUSH();
     }
 

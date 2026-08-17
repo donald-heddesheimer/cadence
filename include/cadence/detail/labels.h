@@ -1,13 +1,5 @@
-// cadence: label interning.
-//
-// A label is resolved to a small integer once per call site, not once per execution: the scope macros hold the result in a function-local static, so the second and every later pass through a scope costs one guard-variable load. Three things follow from that.
-//
-//   1. A record carries a 4-byte id instead of an 8-byte pointer.
-//   2. Flush() indexes a vector instead of hashing a string into a map.
-//   3. The label no longer has to outlive the flush that consumes it, because
-//      the string was copied when it was interned.
-//
-// Constructing a scope class directly, rather than through the macros, interns on every construction and takes a lock to do it. That is the slow path and the reason the macros exist.
+// Label interning. Scope macros cache a compact handle at each call site;
+// directly constructed scopes resolve their labels on every execution.
 #pragma once
 
 #include <atomic>
@@ -34,7 +26,7 @@ namespace cadence {
     class LabelTable {
        public:
         static LabelTable& Instance() {
-            // labels are referenced by the exit-time report and by thread-local state whose destruction order against a function-local static is not something worth betting a crash on.
+            // Process-lifetime storage avoids static destruction order hazards.
             static LabelTable* instance = new LabelTable();
             return *instance;
         }
@@ -86,7 +78,7 @@ namespace cadence {
     }  // namespace detail
 }  // namespace cadence
 
-// Resolves a label to a handle once per call site. The static is function-local so it is initialized on first pass and thread-safe by C++11 rules; every later pass is a load and a predictable branch.
+// Resolve a label once per call site using thread-safe static initialization.
 #define CADENCE_DETAIL_LABEL(label)                                  \
     ([]() -> const ::cadence::detail::LabelHandle& {                 \
         static const ::cadence::detail::LabelHandle handle =         \

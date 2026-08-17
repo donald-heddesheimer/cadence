@@ -1,10 +1,5 @@
-// cadence: recycled CUDA event storage.
-//
-// cudaEventCreate is far too expensive to call per scope, so events are created once and handed back to a free list when a record is consumed. Events are timing-enabled by design: cudaEventDisableTiming is only correct for events used purely for dependency ordering, and it is not a shortcut available here -- it is a tenth the cost precisely because it skips the timestamp this library exists to read.
-//
-// This pool is the shared one, behind the registry's lock. Threads draw from it in batches into a thread-local cache, so the lock is taken once per refill rather than twice per scope.
-//
-// A CUDA event belongs to the device that was current when it was created, and neither cudaEventRecord against a stream on another device nor cudaEventElapsedTime across a device boundary is legal. One pool per device rather than one pool overall is therefore not a refinement; it is what keeps a two-GPU process from recording against handles the driver will reject.
+// Recycled, timing-enabled CUDA events. Threads refill local caches in batches,
+// and each device owns a separate pool because CUDA events are device-local.
 #pragma once
 
 #include <cstddef>
@@ -24,11 +19,11 @@ namespace cadence {
         EventPool& operator=(const EventPool&) = delete;
 
         ~EventPool() {
-            // at static-destruction time the CUDA runtime may already be gone, and there is nothing useful to do about a failure here.
+            // Destruction may run after CUDA teardown; failures are non-actionable.
             for (cudaEvent_t event : free_) cudaEventDestroy(event);
         }
 
-        // Returns nullptr if the runtime refuses to create an event
+        // Returns nullptr if CUDA cannot create an event.
         cudaEvent_t Acquire() {
             if (!free_.empty()) {
                 cudaEvent_t event = free_.back();

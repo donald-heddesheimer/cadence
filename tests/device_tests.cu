@@ -25,7 +25,7 @@ namespace {
         if (!ok) ++failures;
     }
 
-    // Busy-waits on the device for a controllable number of loop iterations. Duration is not calibrated to wall clock -- the tests assert on ratios between stages, which holds whatever the clock rate turns out to be.
+    // Generate controllable GPU work; tests compare ratios rather than wall time.
     __global__ void Spin(float* sink, int iterations) {
         float value = 0.0f;
         for (int i = 0; i < iterations; ++i) value = fmaf(value, 1.0000001f, 1e-7f);
@@ -36,7 +36,7 @@ namespace {
     constexpr int NUM_BLOCKS = 256;
     constexpr int NUM_THREADS = 256;
 
-    // Slack allowed when checking where a GPU span landed on the host clock. The anchor is dated to the midpoint of the bracket around its synchronize, which leaves a residual of a microsecond or two; measured margins run from about 1 us to several hundred.
+    // Allow for midpoint error when placing GPU spans on the host clock.
     constexpr std::int64_t TRACE_TOLERANCE_NS = 50000;
 
     void BurnHostMicroseconds(int microseconds) {
@@ -117,7 +117,7 @@ namespace {
               "chained stage discarded exactly the warmup iterations");
     }
 
-    // The documented cost of chaining: work enqueued on the stream between two stages is charged to the second one. This is the test that would fail if that contract were ever quietly changed.
+    // Chained stages charge uninstrumented gaps to the following stage.
     void TestChainingChargesGapsToTheNextStage(float* sink, cudaStream_t stream) {
         ResetLibrary(2, 1);
         for (int i = 0; i < 30; ++i) {
@@ -160,7 +160,7 @@ namespace {
         CheckNear(second / first, 1.0, 0.20, "a paired scope is unaffected by an uninstrumented launch");
     }
 
-    // Chained records share their boundary events, so the release logic has to hand each event back exactly once. Too many releases corrupts the free list; too few leaks. Both show up as a live-event count that will not settle.
+    // Shared chain events must return to the pool exactly once.
     void TestEventPoolSettles(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 1);
         const auto run = [&](int iterations) {
@@ -192,7 +192,8 @@ namespace {
               "every chained iteration produced exactly one sample");
     }
 
-    // Chains are tracked per stream, so interleaving two streams must not splice one stream's events into the other's chain. Two concurrent streams contend for the GPU, which makes an absolute duration a poor thing to assert on -- so each stream's chained result is compared against the same stream's paired result under the same interleaving, where contention affects both equally and a crossed chain would not.
+    // Interleaved streams must keep independent stage chains. Compare each
+    // chained result with a paired scope under the same contention.
     void TestChainsArePerStream(float* sink, cudaStream_t first, cudaStream_t second) {
         const auto runLoop = [&](bool chained) {
             for (int i = 0; i < 30; ++i) {
@@ -251,7 +252,7 @@ namespace {
         ResetLibrary(0, 1);
     }
 
-    // Chained stages borrow each other's events, so sampling has to thin whole chains rather than individual stages. Before this was handled, ScopedStage consulted no sampling state at all and CADENCE_STAGE quietly recorded every iteration no matter what sampleEvery said.
+    // Sampling keeps or drops an entire chained-stage sequence.
     void TestStageSamplingThinsWholeChains(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 4);
         for (int i = 0; i < 100; ++i) {
@@ -269,12 +270,13 @@ namespace {
         const std::size_t first = CountOf(snapshot, "staged-a", cadence::ScopeKind::Device);
         const std::size_t second = CountOf(snapshot, "staged-b", cadence::ScopeKind::Device);
         Check(first == 25, "sampleEvery=4 measured 25 of 100 chained iterations");
-        // The two stages have to agree exactly: a chain that kept one stage and dropped the other would leave the survivor measuring itself plus the gap where its neighbour used to be.
+        // Sampling keeps or drops the complete chain so gaps are not misattributed.
         Check(first == second, "both stages of a chain were kept or dropped together");
         ResetLibrary(0, 1);
     }
 
-    // Recording into a capturing stream does not merely produce a wrong number. cudaEventRecord succeeds, then every later query against the event fails, and a flush issued while capture is still open poisons the capture outright: cudaStreamEndCapture returns an error and hands back a null graph. The scope has to stand down instead.
+    // Events recorded during capture become part of the graph and cannot be
+    // queried safely. Scopes must skip captured streams.
     void TestStreamCaptureIsRefusedRatherThanCorrupted(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 1);
         cudaGraph_t graph = nullptr;
@@ -306,7 +308,8 @@ namespace {
         ResetLibrary(0, 1);
     }
 
-    // The damaging arrangement, and not a contrived one: a loop body that already ends in CADENCE_FLUSH, wrapped in a capture. The flush waits on whatever the scopes recorded, and waiting on an event last recorded in a capturing stream invalidates the capture, so cudaStreamEndCapture fails and the application is handed a null graph. Instrumentation that breaks the program it is measuring is the one outcome worth a test of its own.
+    // Flushing a scope recorded during capture invalidates the graph. Verify that
+    // instrumentation skips the scope and preserves capture completion.
     void TestFlushInsideCaptureLeavesTheGraphIntact(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 1);
         cudaGraph_t graph = nullptr;
@@ -351,7 +354,7 @@ namespace {
         ResetLibrary(0, 1);
     }
 
-    // The invariant that decides whether a trace is worth opening: a GPU span has to sit inside the host scope that launched and waited for it. A CUDA event carries a GPU timestamp no API converts to host time, so the placement comes from watching one anchor event complete at a known host instant. Anchor it wrongly and every span still looks plausible in isolation while the timeline as a whole is fiction, which is why this asserts containment rather than merely that timestamps are non-zero.
+    // GPU spans must fall inside the host scope that launches and waits for them.
     void TestTraceSpansNestInsideTheirHostScope(float* sink, cudaStream_t stream) {
         cadence::Config config;
         config.reportStream = nullptr;
@@ -376,7 +379,7 @@ namespace {
                 }
                 cudaStreamSynchronize(stream);
             }
-            // Host work between the scope closing and the flush, which is what a real loop does and what separates a correct anchor from a plausible one. Dating spans from when the flush ran rather than from an event recorded for the purpose shifts every GPU span later by exactly this delay.
+            // Add host delay that would expose a flush-time anchor error.
             BurnHostMicroseconds(1000);
             cadence::Flush();
         }
@@ -402,7 +405,7 @@ namespace {
                 ++checked;
                 const std::int64_t spanStart = span.startNs;
                 const std::int64_t spanEnd = spanStart + static_cast<std::int64_t>(span.durationMs * 1e6);
-                // The anchor is observed across a synchronize and dated to the midpoint of that bracket, so placement is good to a couple of microseconds rather than exactly. The tolerance is far below the error a wrong anchor produces, which is the whole host delay above.
+                // Allow midpoint timing error while remaining below the injected delay.
                 if (spanStart >= loopStart - TRACE_TOLERANCE_NS && spanEnd <= loopEnd + TRACE_TOLERANCE_NS) ++contained;
                 if (span.label == "first") first = &span;
                 if (span.label == "second") second = &span;
@@ -421,7 +424,7 @@ namespace {
         cadence::Reset();
     }
 
-    // Rows must carry the GPU that produced them. Only the single-device half of that is checkable here -- this machine has one card -- but it is the half that every run exercises: an attribution that silently came back -1 would make the report's device column vanish on the machines that need it.
+    // Rows must retain the device id produced by the single available GPU.
     void TestDeviceRowsCarryTheirDevice(float* sink, cudaStream_t stream) {
         cadence::Config config;
         config.warmupIterations = 0;

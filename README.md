@@ -8,11 +8,10 @@ Time the stages of a CUDA loop from inside your own process. Header-only, C++17.
 [![standard](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](include/cadence)
 
-Wrap the stages you care about, run your application normally, and it prints a
-latency distribution when it exits. No profiler to launch, no process to attach,
-no capture file to open. The instrumentation compiles into your binary, so you
-can leave it in and look at every run instead of only the ones you thought to
-profile.
+Wrap the stages you care about and run the application normally. cadence prints
+latency distributions when the process exits. The instrumentation is compiled
+into the binary, so it can measure ordinary runs without a separate profiler or
+capture step.
 
 ## Quick start
 
@@ -38,18 +37,15 @@ Reading it:
 - **Two rows per label.** `device` is GPU execution measured with CUDA events;
   `host` is CPU time spent issuing the work. When they converge, the stage is
   launch-bound rather than compute-bound.
-- **The distribution column** is what a mean hides. A lone mark far right is a
-  stall, and no column of averages would tell you it existed.
-- **The deadline line** counts misses instead of averaging overshoot, because a
-  loop that blows its budget once in fifty has a healthy mean and a real problem.
-- **The slowest iterations** are kept whole, so you see which passes missed and
-  where their time went, not just that some did.
+- **The distribution column** exposes outliers that a mean can hide.
+- **The deadline line** reports how many iterations exceeded the budget.
+- **The slowest iterations** retain their stage breakdowns for diagnosis.
 
 ## How it stays out of the way
 
-Timing GPU work usually means synchronizing to read a stopwatch, which changes
-the thing being timed. cadence records events and walks away; the numbers are
-resolved later, at a boundary where you were already going to synchronize.
+cadence records CUDA events without synchronizing each scope. It resolves them
+later at an application synchronization boundary, avoiding a blocking read on
+every measurement.
 
 Buffers are thread-local, so threads do not contend; statistics are folded in
 with Welford's method and a sample reservoir, so a loop running for a week costs
@@ -66,11 +62,9 @@ cfg.tracePath = "worst.json";   // or: CADENCE_TRACE=worst.json ./app
 
 ![One iteration on the Perfetto timeline. On the host lane both kernel launches have returned within the first 10µs; on the device lane saxpy runs until 41µs and scale does not begin until 43µs, leaving a visible gap between a launch and the work it queued](docs/timeline.png)
 
-One lane for the CPU, one per CUDA stream, on a shared clock. Above, `scale` was
-queued at 10µs and did not start on the GPU until 43µs — a gap you would never
-infer from two columns of durations. Only the worst iterations are exported; a
-trace of a whole run is enormous and nobody scrolls a million spans looking for
-the bad one.
+The trace uses one CPU lane and one lane per CUDA stream on a shared clock. In
+the example, `scale` was queued at 10µs and started on the GPU at 43µs. Only the
+retained slow iterations are exported, keeping the trace small enough to inspect.
 
 ## Where it fits
 
@@ -80,7 +74,7 @@ the bad one.
 | Nsight Systems | what the whole system did over a few seconds | launch under `nsys`, open the capture | one-off investigation |
 | Nsight Compute | why one kernel is slow, to hardware counters | `ncu`, which replays each kernel | no, orders of magnitude slower |
 | nvbench | how a kernel scales across a parameter sweep | a separate benchmark binary | no, measures kernels not your app |
-| Hand-rolled `cudaEvent` | whatever you wired up | you write it | the obvious version blocks per kernel: 6.5µs a scope against cadence's 3.4µs |
+| Hand-rolled `cudaEvent` | the measurements you implement | application code | a blocking implementation measured 6.5µs per scope versus cadence's 3.4µs |
 
 cadence complements the Nsight tools. Use it to find *when and where* you got
 slow, then `nsys` or `ncu` for *why*. Every scope also emits an NVTX range, so
@@ -89,12 +83,11 @@ the same instrumentation shows up on the Nsight timeline for free.
 ## Features
 
 - **Distributions, not averages.** mean, min, p50, p95, max, stddev, jitter.
-- **Exact where it counts.** Past the retention cap, count, mean, stddev, min,
-  max and the deadline verdict stay exact; only percentiles and the histogram
-  become estimates, drawn from a uniform sample of the whole run rather than a
-  recent window.
-- **Colour when a terminal is watching.** Auto-detected, and `NO_COLOR` is
-  honoured; a redirected run and the `outputPath` copy stay clean text.
+- **Bounded sampling.** Past the retention cap, count, mean, stddev, min, max,
+  and deadline results remain exact. Percentiles and histograms are estimated
+  from a uniform sample of the full run.
+- **Color for interactive output.** Auto-detected and disabled by `NO_COLOR`;
+  redirected output and `outputPath` remain plain text.
 - **CPU and GPU through one API.** Host timers compile in translation units with
   no CUDA in them.
 - **A row per GPU.** A process driving several cards gets one row each and a `dev`
@@ -147,7 +140,7 @@ cfg.maxSamplesPerLabel = 32768; // retained per row; 0 keeps every observation
 cfg.outputPath = "run.txt";     // also write the report here
 cfg.reportStream = &std::cerr;  // where it prints; nullptr suppresses printing
 cfg.unicodeOutput = false;      // ASCII table for terminals that mangle UTF-8
-cfg.colorOutput = cadence::ColorMode::Auto;  // Auto colours a terminal and nothing else
+cfg.colorOutput = cadence::ColorMode::Auto;  // Color terminal output automatically
 cadence::Configure(cfg);
 
 std::vector<cadence::Stats> rows = cadence::Snapshot();   // assert on these in tests
@@ -161,12 +154,11 @@ observations arrive, which is what keeps the verdict exact on a long run.
 
 ## Overhead
 
-Best difference over 7 x 50,000 scopes on an RTX A4000. Nearly all of
-`CADENCE_KERNEL` is what the CUDA API charges for a timestamped event, not
-anything cadence does; the same call with `cudaEventDisableTiming` costs 153 ns.
-About 200 ns per device scope is the CUDA-graph-capture guard and the device
-query that keeps events paired with the GPU that created them, neither of which
-is optional because the failures they prevent are silent.
+Best difference over 7 x 50,000 scopes on an RTX A4000. Most of the
+`CADENCE_KERNEL` cost comes from CUDA timestamped events; the same call with
+`cudaEventDisableTiming` costs 153 ns. About 200 ns per device scope covers the
+CUDA graph capture guard and the device query used to keep events on their
+originating GPU.
 
 | | ns/scope | |
 |---|---:|---|
@@ -179,21 +171,17 @@ is optional because the failures they prevent are silent.
 Wrap stages, not individual small kernels. Below roughly 50 µs of GPU work per
 scope the instrumentation becomes a visible fraction of the result.
 
-Against the version most people write by hand — record either side of the launch,
-then `cudaEventSynchronize` and read the elapsed time out — cadence costs about
-half as much per scope and takes noticeably less out of the loop: over 50,000
-launches the hand-rolled version runs 3.7x the uninstrumented wall clock against
-cadence's 2.7x. The gap widens over real work rather than closing, because
-cadence's records go out while the GPU is already busy and a blocking read gives
-up that overlap by construction.
+Compared with a blocking implementation that records around a launch and then
+calls `cudaEventSynchronize`, cadence costs about half as much per scope. Across
+50,000 launches, the blocking version measured 3.7x the uninstrumented wall
+clock and cadence measured 2.7x. Deferred resolution preserves more CPU/GPU
+overlap as kernel duration increases.
 [docs/overhead.md](docs/overhead.md) has the measurements behind this.
 
-That figure was cross-checked outside its own benchmark.
-[docs/case-study.md](docs/case-study.md) puts cadence on llama.cpp's CUDA
-backend, where counting scopes against llama-bench's own throughput puts the cost
-at 3044 and 3227 ns/scope in two configurations — and where wrapping every graph
-node instead of the graph costs 20% of tokens per second, which is the same
-advice as the paragraph above with a price on it.
+The [llama.cpp case study](docs/case-study.md) cross-checks that result against a
+real CUDA backend. Two configurations measured 3044 and 3227 ns per scope;
+instrumenting every graph node reduced throughput by 20%, while graph-level
+instrumentation had no measurable cost.
 
 ## Build and test
 
@@ -206,11 +194,9 @@ Host, disabled-build and self-contained-header tests need no GPU and no CUDA
 toolkit. Device tests build when `nvcc` is found and skip themselves when no
 device answers.
 
-`examples/` has a standalone CUDA loop, and a [ROS 2 node](examples/ros2) whose
-timer callback is held to its own period — so the report's verdict is "did this
-callback hold its rate", which is the question a robotics developer actually has.
-That package builds with colcon and sits outside this build and outside CI,
-because a header-only library should not make every consumer care about ROS 2.
+`examples/` contains a standalone CUDA loop and a [ROS 2 node](examples/ros2)
+whose callback budget matches its timer period. The ROS 2 package builds with
+colcon and remains outside the main build and CI.
 
 ## What it does not do
 
@@ -223,12 +209,9 @@ event permanently unreadable and, if a flush lands before the capture closes,
 invalidates the capture itself. Scopes on a capturing stream therefore record
 nothing and the report says how many stood down. Wrap the graph launch instead.
 
-Per-device rows are implemented and tested, but only against one GPU: no machine
-here has two. The storage keying, the `dev` column, the deadline line's choice of
-which card to report, and the summary's refusal to add two cards' concurrent
-spans into one total are each covered by a test verified to fail without the
-change. None of that is the same as having watched it run on two cards, and it is
-not claimed to be.
+Per-device rows and multi-GPU report behavior have unit coverage, but have only
+been run on single-GPU hardware. Live multi-GPU behavior is therefore not yet
+validated.
 
 ## License
 

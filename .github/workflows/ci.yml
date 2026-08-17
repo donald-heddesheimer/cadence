@@ -11,9 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The bulk of cadence is testable without a GPU, and that is deliberate: the
-  # statistics, the warmup rule, the interning and the CSV are where a wrong
-  # number would come from, and none of them need a driver.
+  # Exercise host-reachable behavior across compilers and build types.
   host:
     name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
     runs-on: ubuntu-latest
@@ -37,9 +35,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # cadence hands out raw CUDA event handles between threads and recycles them
-  # through a pool. Both sanitizers are cheap here and would catch the classes of
-  # bug that pooling invites.
+  # Check event-pool ownership and concurrent registry access.
   sanitizers:
     name: ${{ matrix.sanitizer }}
     runs-on: ubuntu-latest
@@ -64,20 +60,8 @@ jobs:
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
-  # How much of the library the tests actually reach.
-  #
-  # The scoping solves itself. CADENCE_HAS_CUDA comes from __has_include of
-  # <cuda_runtime.h> in platform.h, so on a runner with no CUDA toolkit the
-  # device paths are preprocessed away before gcov ever sees them. The number
-  # below is therefore the host-reachable surface exactly, with no filter
-  # gymnastics and no dilution from lines only a GPU could execute. The device
-  # half is compile-checked by the `cuda` job and exercised by
-  # cadence_device_tests on real hardware.
-  #
-  # The gate is set below the number the tests currently reach rather than at it.
-  # A threshold pinned to the high-water mark turns every honest refactor into a
-  # coverage failure, and the job is here to catch a real regression, not to make
-  # the number a ratchet.
+  # Measure the host-reachable headers; CUDA paths are preprocessed out on this
+  # runner and compile-checked separately below.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -97,18 +81,13 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Report
         run: |
-          # negative_hits is a gcov bug, not a coverage problem: on an inlined
-          # ternary it can emit "branch 1 taken -1", which is not a number of
-          # times anything happened. See gcc PR 68080. Warning once per file
-          # keeps it visible in the log while letting the run finish; the gate
-          # below is on lines, which the bug does not touch.
+          # Work around GCC PR 68080; the line-coverage gate is unaffected.
           gcovr -r . --filter 'include/cadence/' \
             --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
             --txt coverage.txt --xml coverage.xml \
             --fail-under-line 85
           cat coverage.txt
-          # Also on the run's summary page, so the number is readable without
-          # opening the log or waiting on a third party.
+          # Publish the result on the workflow summary.
           {
             echo '### Coverage (host-reachable headers)'
             echo '```'
@@ -120,13 +99,10 @@ jobs:
         with:
           files: coverage.xml
           token: ${{ secrets.CODECOV_TOKEN }}
-          # The gate above is what fails a bad change. Codecov is presentation,
-          # so an outage there -- or a repo not yet authorized -- must not turn
-          # this job red.
+          # The local gcovr threshold is authoritative.
           fail_ci_if_error: false
 
-  # No GPU on a hosted runner, so this proves the device path compiles and that
-  # the device tests skip cleanly rather than fail when no device answers.
+  # Compile CUDA paths and verify clean test skips without a hosted GPU.
   cuda:
     name: cuda build
     runs-on: ubuntu-latest
@@ -145,8 +121,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # The import story the README sells: install the package, then consume it from
-  # a separate project through find_package.
+  # Install and consume cadence through find_package from a separate project.
   install:
     name: install and consume
     runs-on: ubuntu-latest
@@ -193,8 +168,5 @@ jobs:
           cmake --build consumer/build -j
           ./consumer/build/consumer
 
-  # No clang-format job. The house style indents only the outermost namespace,
-  # which no NamespaceIndentation setting produces, so clang-format cannot be
-  # made authoritative here without rewriting every header against the style.
-  # .clang-format still describes the intent for editors; it is a guide rather
-  # than a gate. Re-add a job here if the namespace rule is ever dropped.
+  # Formatting remains editor-guided because the namespace layout is not
+  # representable by clang-format.

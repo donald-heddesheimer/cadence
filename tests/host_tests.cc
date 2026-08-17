@@ -1,4 +1,4 @@
-// Host-only tests for cadence. No CUDA, no GPU, no driver required: these cover the logic that decides whether the reported numbers are correct.
+// Host-only coverage for report, statistics, and registry behavior.
 
 #include <cadence/cadence.h>
 
@@ -34,14 +34,14 @@ namespace {
 #define CHECK(cond) Check((cond), #cond, __LINE__)
 #define CHECK_NEAR(actual, expected, tol) CheckNear((actual), (expected), (tol), #actual, __LINE__)
 
-    // A scope with an empty body can measure zero nanoseconds, and a zero-length span is discarded as a stalled clock. Tests that count samples spin briefly so the count depends on the thing under test rather than on clock resolution.
+    // Ensure counted scopes exceed the clock resolution and are not discarded.
     void BurnBriefly() {
         const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(2);
         while (std::chrono::steady_clock::now() < until) {
         }
     }
 
-    // Finds one row of a Snapshot() by label and scope. Takes the snapshot itself rather than a reference into one. Returning a pointer into a vector the caller passed as a temporary is a use-after-free waiting for the first person who writes Find(cadence::Snapshot(), ...).
+    // Take ownership so a pointer into a temporary Snapshot remains valid.
     cadence::Stats Find(const std::string& label, cadence::ScopeKind kind, bool* found = nullptr) {
         const std::vector<cadence::Stats> rows = cadence::Snapshot();
         for (const cadence::Stats& row : rows) {
@@ -118,7 +118,7 @@ namespace {
         cadence::Reset();
 
         cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
-        // One observation per flush: the counter has to survive the flush boundary, which is the whole point of keeping it in the registry.
+        // The warmup counter persists across flush boundaries.
         for (int i = 0; i < 4; ++i) {
             registry.RecordHost("perloop", 2.0);
             cadence::Flush();
@@ -189,16 +189,16 @@ namespace {
         cadence::WriteReport(out);
         const std::string text = out.str();
 
-        // Provenance: warmup must be visible in the artifact, so nobody quotes a throttled run as gospel.
+        // Warmup is report provenance needed to interpret the measurements.
         CHECK(text.find("cadence report") != std::string::npos);
-        CHECK(text.find("1 iteration(s) discarded per label") != std::string::npos);
+        CHECK(text.find("1 iteration discarded per label") != std::string::npos);
         // The row itself: two kept samples of 1.5 and 2.5 ms, so a 2.00 ms mean rendered in milliseconds.
         CHECK(text.find("reportlabel") != std::string::npos);
         CHECK(text.find("2.00ms") != std::string::npos);
         CHECK(text.find("distribution") != std::string::npos);
     }
 
-    // Units are chosen per number, not per report: a host scope measured in microseconds and a kernel measured in milliseconds appear in one table and both have to be readable.
+    // Choose units independently for each measurement.
     void TestDurationFormatting() {
         CHECK(cadence::detail::FormatDuration(0.0000005, false) == "0.50ns");
         CHECK(cadence::detail::FormatDuration(0.005025, false) == "5.03us");
@@ -206,11 +206,11 @@ namespace {
         CHECK(cadence::detail::FormatDuration(0.19, false) == "190us");
         CHECK(cadence::detail::FormatDuration(2.0, false) == "2.00ms");
         CHECK(cadence::detail::FormatDuration(1500.0, false) == "1.50s");
-        // The micro sign is two bytes in UTF-8, so the ASCII fallback is not merely cosmetic.
+        // The ASCII fallback must replace the two-byte UTF-8 micro sign.
         CHECK(cadence::detail::FormatDuration(0.0686, true) == "68.6\xc2\xb5s");
     }
 
-    // The histogram is the only part of the report that shows shape rather than summary, so an empty bin must stay empty: that gap is what distinguishes a bimodal label from a merely wide one.
+    // Empty bins must remain visible to preserve distribution shape.
     void TestHistogramRendering() {
         std::array<std::uint32_t, cadence::NUM_HISTOGRAM_BINS> histogram{};
         histogram[0] = 10;
@@ -232,7 +232,7 @@ namespace {
         CHECK(cadence::detail::RenderHistogram(empty, false).empty());
     }
 
-    // A zero-nanosecond host span is a failed measurement, not a fast one, and letting one through pins the label's minimum at zero and stretches its jitter across a range nothing occupied.
+    // Zero-length host spans are failed clock measurements and must be dropped.
     void TestStalledClockSamplesAreDropped() {
         cadence::Config config;
         config.warmupIterations = 0;
@@ -260,8 +260,8 @@ namespace {
         CHECK(out.str().find("monotonic clock did not advance") != std::string::npos);
     }
 
-    // A budget is a count of misses, not an average overshoot: a loop that blows its deadline once in fifty has a healthy mean and a real problem.
-    // The reservoir bounds memory, and everything a deadline is judged on has to survive that. Count, extremes, mean, stddev and the miss count are maintained in constant space and stay exact no matter how far the run outruns the cap.
+    // Deadline counts and aggregate statistics remain exact after reservoir
+    // sampling begins.
     void TestBoundedRetentionKeepsExactAggregates() {
         constexpr std::size_t CAP = 64;
         constexpr int NUM_SAMPLES = 5000;
@@ -290,7 +290,7 @@ namespace {
         // The mean of 1..N is exact, so the standard deviation has a closed form to check it against.
         CHECK_NEAR(row.stddevMs, 1443.5205, 1e-2);
 
-        // The estimated percentiles still have to land in the right neighbourhood, or the cap has traded a memory bug for a reporting one.
+        // Estimated percentiles remain within the expected range.
         CHECK(row.p50Ms > 2000.0 && row.p50Ms < 3000.0);
         CHECK(row.p95Ms > 4300.0 && row.p95Ms < 5000.0);
 
@@ -311,7 +311,7 @@ namespace {
         CHECK(small.count == 10);
     }
 
-    // The cap is what stops a loop left running for a week from growing until it is killed, so the bound itself is worth asserting rather than inferring.
+    // The configured reservoir cap bounds retained memory.
     void TestRetentionCapBoundsMemory() {
         constexpr std::size_t CAP = 32;
         cadence::Config config;
@@ -328,7 +328,7 @@ namespace {
         const cadence::Stats row = Find("capped", cadence::ScopeKind::Host);
         CHECK(row.count == 10000);
 
-        // Reservoir sampling is uniform over the whole run, so the retained samples should span the values the run actually produced rather than clustering on the most recent ones.
+        // Uniform sampling preserves the full observed range.
         CHECK_NEAR(row.minMs, 1.0, 1e-9);
         CHECK_NEAR(row.maxMs, 7.0, 1e-9);
         CHECK_NEAR(row.meanMs, 4.0, 0.05);
@@ -396,7 +396,8 @@ namespace {
         CHECK(off.str().find("slowest iterations") == std::string::npos);
     }
 
-    // Every lane has to land on its own row in a viewer, which is the entire reason to write a trace rather than another table. Thread id 0 is the idle task by the convention Perfetto inherits from the kernel, and a track claiming it gets folded into a neighbour instead of drawn: the host spans then nest inside a device stream's track and the launch-ahead-of-kernel gap stops being visible. Nothing about the file looks wrong when this happens, so it is pinned here rather than left to be noticed in a screenshot.
+    // Perfetto reserves thread id 0 for the idle task. Assign distinct nonzero
+    // ids so host and device spans render on separate tracks.
     void TestTraceLanesAreDistinctThreads() {
         cadence::TraceIteration iteration;
         iteration.index = 0;
@@ -419,7 +420,7 @@ namespace {
         CHECK(json.find("\"tid\":3,\"name\":\"scale\"") != std::string::npos);
     }
 
-    // The trace is the same retained iterations in a format a timeline viewer opens. Exporting a whole run would be enormous and useless; exporting the passes that actually missed is neither.
+    // Export retained iterations as a valid, rebased trace.
     void TestTraceJsonShape() {
         cadence::Config config;
         config.warmupIterations = 0;
@@ -463,7 +464,7 @@ namespace {
         CHECK(balanced && depth == 0);
     }
 
-    // One row of a report, built by hand. The recording path that keys samples by device is compiled out of a host-only build, so the presentation half is driven from synthesized statistics instead -- which is the half a second GPU changes anyway.
+    // Synthesize per-device rows to exercise presentation without CUDA.
     cadence::Stats MakeRow(const char* label, cadence::ScopeKind kind, int device, const std::vector<double>& samples, double budgetMs = 0.0) {
         cadence::Stats row = cadence::detail::ComputeStats(label, kind, samples, 0, budgetMs);
         row.device = device;
@@ -482,7 +483,9 @@ namespace {
         return out.str();
     }
 
-    // The summary is the only line of the report that states a conclusion rather than a measurement, which makes it the one line worth getting right: a reader quotes it. Summing one mean per label silently assumes each label runs once per pass. Instrumenting llama.cpp's decode per graph node broke that assumption -- 178 matrix multiplies a token, all under one label -- and the line then described a workload that is 99.8% GPU-bound as 7.3% GPU-bound. Not a rounding error, the opposite conclusion, stated confidently.
+    // Summary totals must weight repeated labels by their observations per
+    // iteration. Otherwise a graph with many operations under one label is
+    // incorrectly classified as host-bound.
     void TestSummaryWeightsLabelsByHowOftenTheyRun() {
         // 10 iterations of a 2.00ms loop body. One kernel runs once per pass at 100us; the other runs ten times per pass at 100us, so it is 1.00ms of the iteration and the naive sum would call it 100us.
         std::vector<cadence::Stats> rows;
@@ -492,7 +495,7 @@ namespace {
 
         const std::string text = RenderSummary(rows);
         // 0.100ms + 10 x 0.100ms = 1.10ms of GPU work per iteration, which is 55% of a 2.00ms pass.
-        CHECK(text.find("1.10ms per iteration across 2 label(s)") != std::string::npos);
+        CHECK(text.find("1.10ms per iteration across 2 labels") != std::string::npos);
         CHECK(text.find("55.0% is GPU work") != std::string::npos);
         CHECK(text.find("900us is launch and synchronization") != std::string::npos);
         // The unweighted answer must not appear anywhere: 200us of device work, wrongly leaving 90% of the pass as overhead.
@@ -500,14 +503,14 @@ namespace {
         CHECK(text.find("10.0% is GPU work") == std::string::npos);
     }
 
-    // Without a loop scope there is no iteration to divide by, and the honest response is to publish the sum of the means as a sum of the means rather than to dress it up as a per-iteration figure.
+    // Without a loop scope, report a sum of means instead of a per-iteration rate.
     void TestSummaryWithholdsTheConclusionWithoutALoopScope() {
         std::vector<cadence::Stats> rows;
         rows.push_back(MakeRow("first", cadence::ScopeKind::Device, 0, std::vector<double>(10, 0.1)));
         rows.push_back(MakeRow("second", cadence::ScopeKind::Device, 0, std::vector<double>(100, 0.1)));
 
         const std::string text = RenderSummary(rows);
-        CHECK(text.find("200us across 2 label(s), one mean each") != std::string::npos);
+        CHECK(text.find("200us across 2 labels, one mean each") != std::string::npos);
         CHECK(text.find("per iteration") == std::string::npos);
         CHECK(text.find("is GPU work") == std::string::npos);
 
@@ -517,7 +520,7 @@ namespace {
         CHECK(RenderSummary(rows).find("per iteration") == std::string::npos);
     }
 
-    // The breakdown is read, not parsed, so it has to stay one readable line however many spans an iteration contains. A graph executor hands over hundreds: the llama.cpp run put roughly 250 spans on one line, several thousand characters of it, and nothing could be read out of it.
+    // Fold and cap graph workloads so the breakdown remains readable.
     void TestWorstIterationBreakdownFoldsAndCaps() {
         cadence::TraceIteration iteration;
         iteration.index = 7;
@@ -559,7 +562,7 @@ namespace {
         CHECK(single.str().find(" x") == std::string::npos);
     }
 
-    // Iterations are ranked by whichever span actually covers the pass. A loop that queues asynchronous work and synchronizes elsewhere has a host scope that returns in microseconds against milliseconds of GPU time, and ranking those by the host span ranks them by host jitter: the llama.cpp run retained an iteration for 18.9us of host noise while the slowest GPU pass in the run never appeared.
+    // Rank asynchronous iterations by device work when it exceeds the host span.
     void TestWorstIterationsRankByTheLongerOfHostAndDevice() {
         std::vector<cadence::detail::IterationSpan> queued;
         queued.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Host, 0.008, 0, 0});
@@ -579,7 +582,7 @@ namespace {
         CHECK_NEAR(cadence::detail::IterationSpanMs(deviceOnly), 2.0, 1e-9);
     }
 
-    // Two GPUs running the same label must not share a row. Averaging them answers a question nobody asked: the reason to look at two cards is that one of them is slower.
+    // Each GPU keeps an independent row so device differences remain visible.
     void TestDeviceSamplesKeyByDevice() {
         cadence::detail::LabelSamples samples;
         cadence::detail::SlotFor(samples, 7, 1).gpu.Add(2.0, 0.0, 0);
@@ -674,8 +677,8 @@ namespace {
         std::ostringstream out;
         cadence::detail::WriteSummary(out, rows, false, cadence::detail::Theme{});
         const std::string text = out.str();
-        CHECK(text.find("3.00ms per iteration across 2 label(s) on device 0") != std::string::npos);
-        CHECK(text.find("4.00ms per iteration across 1 label(s) on device 1") != std::string::npos);
+        CHECK(text.find("3.00ms per iteration across 2 labels on device 0") != std::string::npos);
+        CHECK(text.find("4.00ms per iteration across 1 label on device 1") != std::string::npos);
         CHECK(text.find("7.00ms") == std::string::npos);
         // The remainder is launch and synchronization only while there is one GPU to subtract, so with several the line is withheld rather than guessed at.
         CHECK(text.find("launch and synchronization") == std::string::npos);
@@ -685,7 +688,7 @@ namespace {
         std::ostringstream one;
         cadence::detail::WriteSummary(one, rows, false, cadence::detail::Theme{});
         const std::string single = one.str();
-        CHECK(single.find("3.00ms per iteration across 2 label(s)") != std::string::npos);
+        CHECK(single.find("3.00ms per iteration across 2 labels") != std::string::npos);
         CHECK(single.find("on device") == std::string::npos);
         CHECK(single.find("launch and synchronization") != std::string::npos);
     }

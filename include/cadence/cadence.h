@@ -1,4 +1,4 @@
-// cadence: a header-only, drop-in CUDA timing library for real-time loops.
+// cadence: in-process CPU and CUDA timing for iterative workloads.
 //
 // Include this one header. Everything else lives under cadence/detail/.
 //
@@ -10,7 +10,7 @@
 //   }
 //   CADENCE_REPORT();             // prints the report
 
-#pragma once  // ensure the header is only pulled in one time
+#pragma once
 
 #include <cstdlib>
 #include <fstream>
@@ -28,18 +28,18 @@
 #include "cadence/detail/trace.h"
 
 namespace cadence {
-    // Apply a configuration. Environment variables still win over whatever is set here; see detail/config.h for the list.
+    // Apply configuration. Environment variables take precedence.
     inline void Configure(const Config& config) { detail::Registry::Instance().Configure(config); }
     inline Config GetConfig() { return detail::Registry::Instance().GetConfig(); }
 
-    // Consume pending records: wait on the recorded stop events, compute elapsed times, discard warmup, fold into per-label statistics.
-    // This synchronizes. Call it at a loop or frame boundary
+    // Resolve pending records and update statistics. This synchronizes, so call
+    // it at a loop or frame boundary.
     inline void Flush() { detail::Registry::Instance().Flush(); }
 
     // Per-label statistics for everything flushed so far.
     inline std::vector<Stats> Snapshot() { return detail::Registry::Instance().Snapshot(); }
 
-    // Drop all accumulated statistics. Warmup counters reset too, so the next N observations per label are discarded again.
+    // Clear statistics and restart warmup counters.
     inline void Reset() { detail::Registry::Instance().Reset(); }
 
     inline RunInfo QueryRunInfo() { return detail::QueryRunInfo(); }
@@ -47,10 +47,10 @@ namespace cadence {
     // Records dropped because event creation or an elapsed-time query failed.
     inline std::size_t FailedRecordCount() { return detail::Registry::Instance().FailedRecordCount(); }
 
-    // Host spans dropped because the monotonic clock did not advance across them. Nonzero says the machine's clock is unreliable under load, not that the measured code was fast.
+    // Host spans dropped because the monotonic clock did not advance.
     inline std::size_t StalledClockCount() { return detail::Registry::Instance().StalledClockCount(); }
 
-    // Scopes that recorded nothing because their stream was capturing into a CUDA graph. Always zero in a build without CUDA.
+    // Scopes skipped during CUDA graph capture. Always zero without CUDA.
     inline std::size_t CapturedScopeCount() {
 #if CADENCE_HAS_CUDA
         return detail::Registry::Instance().CapturedScopeCount();
@@ -59,13 +59,15 @@ namespace cadence {
 #endif
     }
 
-    // The slowest iterations kept so far, slowest first, each with the stages that ran inside it. An iteration is everything recorded between two flushes. Governed by Config::numWorstIterations.
+    // Retained slow iterations, ordered slowest first. An iteration contains all
+    // records between two flushes.
     inline std::vector<TraceIteration> WorstIterations() { return detail::Registry::Instance().WorstIterations(); }
 
     // Render the report to an already-open stream. Does not flush first.
     inline void WriteReport(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
 
-    // Write the retained iterations as Chrome Trace Event JSON, which https://ui.perfetto.dev opens directly. Spans carry absolute timestamps only when Config::tracePath was set before the run, since placing GPU work on the host timeline costs an extra query per record at flush.
+    // Write retained iterations as Chrome Trace Event JSON. Absolute GPU
+    // placement is available when Config::tracePath was set before recording.
     inline void WriteTrace(std::ostream& out) { detail::Registry::Instance().WriteTraceTo(out); }
 
     // Returns false if the file could not be opened.
@@ -84,7 +86,8 @@ namespace cadence {
         return out.good();
     }
 
-    // Flush, then print the report to the configured stream and, if outputPath is set, write the same text there. The one call most applications need at shutdown; it also cancels the exit-time fallback.
+    // Flush and write configured report and trace outputs. Calling Report()
+    // disables the exit-time fallback.
     inline bool Report() {
         Flush();
         const Config config = GetConfig();
@@ -98,7 +101,7 @@ namespace cadence {
 
 }  // namespace cadence
 
-// Prefer these over the classes: they are what -DCADENCE_DISABLE removes, and they are the only form that resolves a label once per call site rather than once per execution.
+// Macros compile out under -DCADENCE_DISABLE and cache labels per call site.
 #if CADENCE_ENABLED && CADENCE_HAS_CUDA
 // CADENCE_KERNEL("label")            -- times work on the default stream
 // CADENCE_KERNEL("label", stream)    -- times work on `stream`
@@ -107,7 +110,8 @@ namespace cadence {
     ::cadence::ScopedKernel CADENCE_DETAIL_UNIQUE(cadenceKernelScope_)(CADENCE_DETAIL_LABEL(label), \
                                                                        stream)
 
-// CADENCE_STAGE("label", stream) -- one event per stage instead of two, at the price of charging any gap on the stream to the stage that follows it. See ScopedStage in detail/scopes.h before reaching for it.
+// CADENCE_STAGE records one event per stage. Uninstrumented gaps are charged to
+// the following stage; see ScopedStage for the full contract.
 #define CADENCE_STAGE(...) CADENCE_DETAIL_STAGE_IMPL(__VA_ARGS__, 0, 0)
 #define CADENCE_DETAIL_STAGE_IMPL(label, stream, ...)                                             \
     ::cadence::ScopedStage CADENCE_DETAIL_UNIQUE(cadenceStageScope_)(CADENCE_DETAIL_LABEL(label), \
