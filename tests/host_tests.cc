@@ -396,123 +396,6 @@ namespace {
         CHECK(off.str().find("slowest iterations") == std::string::npos);
     }
 
-    // Rendering helpers for the report writers, which take plain Stats and TraceIteration values and so can be driven without recording anything.
-    cadence::Stats MakeRow(const std::string& label, cadence::ScopeKind kind, std::size_t count, double meanMs) {
-        cadence::Stats row;
-        row.label = label;
-        row.kind = kind;
-        row.count = count;
-        row.meanMs = meanMs;
-        row.minMs = meanMs;
-        row.p50Ms = meanMs;
-        row.p95Ms = meanMs;
-        row.maxMs = meanMs;
-        return row;
-    }
-
-    std::string RenderSummary(const std::vector<cadence::Stats>& rows) {
-        std::ostringstream out;
-        cadence::detail::WriteSummary(out, rows, false, cadence::detail::Theme{});
-        return out.str();
-    }
-
-    // The summary is the only line of the report that states a conclusion rather than a measurement, which makes it the one line worth getting right: a reader quotes it. Summing one mean per label silently assumes each label runs once per pass. Instrumenting llama.cpp's decode per graph node broke that assumption -- 178 matrix multiplies a token, all under one label -- and the line then described a workload that is 99.8% GPU-bound as 7.3% GPU-bound. Not a rounding error, the opposite conclusion, stated confidently.
-    void TestSummaryWeightsLabelsByHowOftenTheyRun() {
-        // 10 iterations of a 2.00ms loop body. One kernel runs once per pass at 100us; the other runs ten times per pass at 100us, so it is 1.00ms of the iteration and the naive sum would call it 100us.
-        std::vector<cadence::Stats> rows;
-        rows.push_back(MakeRow("iteration", cadence::ScopeKind::Host, 10, 2.0));
-        rows.push_back(MakeRow("once", cadence::ScopeKind::Device, 10, 0.1));
-        rows.push_back(MakeRow("often", cadence::ScopeKind::Device, 100, 0.1));
-
-        const std::string text = RenderSummary(rows);
-        // 0.100ms + 10 x 0.100ms = 1.10ms of GPU work per iteration, which is 55% of a 2.00ms pass.
-        CHECK(text.find("1.10ms per iteration across 2 label(s)") != std::string::npos);
-        CHECK(text.find("55.0% is GPU work") != std::string::npos);
-        CHECK(text.find("900us is launch and synchronization") != std::string::npos);
-        // The unweighted answer must not appear anywhere: 200us of device work, wrongly leaving 90% of the pass as overhead.
-        CHECK(text.find("200us") == std::string::npos);
-        CHECK(text.find("10.0% is GPU work") == std::string::npos);
-    }
-
-    // Without a loop scope there is no iteration to divide by, and the honest response is to publish the sum of the means as a sum of the means rather than to dress it up as a per-iteration figure.
-    void TestSummaryWithholdsTheConclusionWithoutALoopScope() {
-        std::vector<cadence::Stats> rows;
-        rows.push_back(MakeRow("first", cadence::ScopeKind::Device, 10, 0.1));
-        rows.push_back(MakeRow("second", cadence::ScopeKind::Device, 100, 0.1));
-
-        const std::string text = RenderSummary(rows);
-        CHECK(text.find("200us across 2 label(s), one mean each") != std::string::npos);
-        CHECK(text.find("per iteration") == std::string::npos);
-        CHECK(text.find("is GPU work") == std::string::npos);
-
-        // Two host-only labels are equally ambiguous: either could be the loop body, so neither is assumed to be.
-        rows.push_back(MakeRow("outer", cadence::ScopeKind::Host, 10, 5.0));
-        rows.push_back(MakeRow("inner", cadence::ScopeKind::Host, 10, 1.0));
-        CHECK(RenderSummary(rows).find("per iteration") == std::string::npos);
-    }
-
-    // The breakdown is read, not parsed, so it has to stay one readable line however many spans an iteration contains. A graph executor hands over hundreds: the llama.cpp run put roughly 250 spans on one line, several thousand characters of it, and nothing could be read out of it.
-    void TestWorstIterationBreakdownFoldsAndCaps() {
-        cadence::TraceIteration iteration;
-        iteration.index = 7;
-        iteration.spanMs = 1.0;
-        // Ten distinct labels, each running three times, so both the fold and the cap have something to do.
-        for (int label = 0; label < 10; ++label) {
-            for (int repeat = 0; repeat < 3; ++repeat) {
-                iteration.spans.push_back(cadence::TraceSpan{
-                    "stage" + std::to_string(label), cadence::ScopeKind::Device, 0.01 * static_cast<double>(label + 1), 0, 1});
-            }
-        }
-        // A host span on the same iteration stays out of the breakdown, as it always has.
-        iteration.spans.push_back(cadence::TraceSpan{"loop", cadence::ScopeKind::Host, 1.0, 0, 0});
-
-        std::ostringstream out;
-        cadence::detail::WriteWorstIterations(out, {iteration}, false, cadence::detail::Theme{});
-        const std::string text = out.str();
-
-        // Repeats fold into one entry carrying their total and their count: 3 x 100us of the widest stage.
-        CHECK(text.find("stage9 300us x3") != std::string::npos);
-        CHECK(text.find("stage8 270us x3") != std::string::npos);
-        // Widest first, so the answer is at the front of the line.
-        CHECK(text.find("stage9") < text.find("stage8"));
-        // Eight of the ten survive the cap, and the two narrowest are counted rather than printed.
-        CHECK(text.find("+2 more") != std::string::npos);
-        CHECK(text.find("stage0") == std::string::npos);
-        CHECK(text.find("stage1 ") == std::string::npos);
-        CHECK(text.find("loop") == std::string::npos);
-        // One line for the iteration, and it stays short enough to read.
-        CHECK(std::count(text.begin(), text.end(), '\n') == 3);
-
-        // A stage that ran once is still printed without a count, which is the shape every single-stage loop produces.
-        cadence::TraceIteration plain;
-        plain.spanMs = 0.05;
-        plain.spans.push_back(cadence::TraceSpan{"saxpy", cadence::ScopeKind::Device, 0.04, 0, 1});
-        std::ostringstream single;
-        cadence::detail::WriteWorstIterations(single, {plain}, false, cadence::detail::Theme{});
-        CHECK(single.str().find("saxpy 40.0us") != std::string::npos);
-        CHECK(single.str().find(" x") == std::string::npos);
-    }
-
-    // Iterations are ranked by whichever span actually covers the pass. A loop that queues asynchronous work and synchronizes elsewhere has a host scope that returns in microseconds against milliseconds of GPU time, and ranking those by the host span ranks them by host jitter: the llama.cpp run retained an iteration for 18.9us of host noise while the slowest GPU pass in the run never appeared.
-    void TestWorstIterationsRankByTheLongerOfHostAndDevice() {
-        std::vector<cadence::detail::IterationSpan> queued;
-        queued.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Host, 0.008, 0, 0});
-        queued.push_back(cadence::detail::IterationSpan{1, cadence::ScopeKind::Device, 3.93, 0, 1});
-        CHECK_NEAR(cadence::detail::IterationSpanMs(queued), 3.93, 1e-9);
-
-        // The ordinary shape, where the loop scope does enclose its GPU work, is unchanged: the host span is the larger of the two by construction.
-        std::vector<cadence::detail::IterationSpan> enclosed;
-        enclosed.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Host, 5.0, 0, 0});
-        enclosed.push_back(cadence::detail::IterationSpan{1, cadence::ScopeKind::Device, 2.0, 0, 1});
-        enclosed.push_back(cadence::detail::IterationSpan{2, cadence::ScopeKind::Device, 1.0, 0, 1});
-        CHECK_NEAR(cadence::detail::IterationSpanMs(enclosed), 5.0, 1e-9);
-
-        // Device-only, which has no host span to prefer in the first place.
-        std::vector<cadence::detail::IterationSpan> deviceOnly;
-        deviceOnly.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Device, 2.0, 0, 1});
-        CHECK_NEAR(cadence::detail::IterationSpanMs(deviceOnly), 2.0, 1e-9);
-    }
-
     // Every lane has to land on its own row in a viewer, which is the entire reason to write a trace rather than another table. Thread id 0 is the idle task by the convention Perfetto inherits from the kernel, and a track claiming it gets folded into a neighbour instead of drawn: the host spans then nest inside a device stream's track and the launch-ahead-of-kernel gap stops being visible. Nothing about the file looks wrong when this happens, so it is pinned here rather than left to be noticed in a screenshot.
     void TestTraceLanesAreDistinctThreads() {
         cadence::TraceIteration iteration;
@@ -578,6 +461,233 @@ namespace {
             if (character == '}' && --depth < 0) balanced = false;
         }
         CHECK(balanced && depth == 0);
+    }
+
+    // One row of a report, built by hand. The recording path that keys samples by device is compiled out of a host-only build, so the presentation half is driven from synthesized statistics instead -- which is the half a second GPU changes anyway.
+    cadence::Stats MakeRow(const char* label, cadence::ScopeKind kind, int device, const std::vector<double>& samples, double budgetMs = 0.0) {
+        cadence::Stats row = cadence::detail::ComputeStats(label, kind, samples, 0, budgetMs);
+        row.device = device;
+        return row;
+    }
+
+    std::string RenderTable(const std::vector<cadence::Stats>& rows) {
+        std::ostringstream out;
+        cadence::detail::WriteStatsTable(out, rows, false, cadence::detail::Theme{});
+        return out.str();
+    }
+
+    std::string RenderSummary(const std::vector<cadence::Stats>& rows) {
+        std::ostringstream out;
+        cadence::detail::WriteSummary(out, rows, false, cadence::detail::Theme{});
+        return out.str();
+    }
+
+    // The summary is the only line of the report that states a conclusion rather than a measurement, which makes it the one line worth getting right: a reader quotes it. Summing one mean per label silently assumes each label runs once per pass. Instrumenting llama.cpp's decode per graph node broke that assumption -- 178 matrix multiplies a token, all under one label -- and the line then described a workload that is 99.8% GPU-bound as 7.3% GPU-bound. Not a rounding error, the opposite conclusion, stated confidently.
+    void TestSummaryWeightsLabelsByHowOftenTheyRun() {
+        // 10 iterations of a 2.00ms loop body. One kernel runs once per pass at 100us; the other runs ten times per pass at 100us, so it is 1.00ms of the iteration and the naive sum would call it 100us.
+        std::vector<cadence::Stats> rows;
+        rows.push_back(MakeRow("iteration", cadence::ScopeKind::Host, 0, std::vector<double>(10, 2.0)));
+        rows.push_back(MakeRow("once", cadence::ScopeKind::Device, 0, std::vector<double>(10, 0.1)));
+        rows.push_back(MakeRow("often", cadence::ScopeKind::Device, 0, std::vector<double>(100, 0.1)));
+
+        const std::string text = RenderSummary(rows);
+        // 0.100ms + 10 x 0.100ms = 1.10ms of GPU work per iteration, which is 55% of a 2.00ms pass.
+        CHECK(text.find("1.10ms per iteration across 2 label(s)") != std::string::npos);
+        CHECK(text.find("55.0% is GPU work") != std::string::npos);
+        CHECK(text.find("900us is launch and synchronization") != std::string::npos);
+        // The unweighted answer must not appear anywhere: 200us of device work, wrongly leaving 90% of the pass as overhead.
+        CHECK(text.find("200us") == std::string::npos);
+        CHECK(text.find("10.0% is GPU work") == std::string::npos);
+    }
+
+    // Without a loop scope there is no iteration to divide by, and the honest response is to publish the sum of the means as a sum of the means rather than to dress it up as a per-iteration figure.
+    void TestSummaryWithholdsTheConclusionWithoutALoopScope() {
+        std::vector<cadence::Stats> rows;
+        rows.push_back(MakeRow("first", cadence::ScopeKind::Device, 0, std::vector<double>(10, 0.1)));
+        rows.push_back(MakeRow("second", cadence::ScopeKind::Device, 0, std::vector<double>(100, 0.1)));
+
+        const std::string text = RenderSummary(rows);
+        CHECK(text.find("200us across 2 label(s), one mean each") != std::string::npos);
+        CHECK(text.find("per iteration") == std::string::npos);
+        CHECK(text.find("is GPU work") == std::string::npos);
+
+        // Two host-only labels are equally ambiguous: either could be the loop body, so neither is assumed to be.
+        rows.push_back(MakeRow("outer", cadence::ScopeKind::Host, 0, std::vector<double>(10, 5.0)));
+        rows.push_back(MakeRow("inner", cadence::ScopeKind::Host, 0, std::vector<double>(10, 1.0)));
+        CHECK(RenderSummary(rows).find("per iteration") == std::string::npos);
+    }
+
+    // The breakdown is read, not parsed, so it has to stay one readable line however many spans an iteration contains. A graph executor hands over hundreds: the llama.cpp run put roughly 250 spans on one line, several thousand characters of it, and nothing could be read out of it.
+    void TestWorstIterationBreakdownFoldsAndCaps() {
+        cadence::TraceIteration iteration;
+        iteration.index = 7;
+        iteration.spanMs = 1.0;
+        // Ten distinct labels, each running three times, so both the fold and the cap have something to do.
+        for (int label = 0; label < 10; ++label) {
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                iteration.spans.push_back(cadence::TraceSpan{
+                    "stage" + std::to_string(label), cadence::ScopeKind::Device, 0.01 * static_cast<double>(label + 1), 0, 1});
+            }
+        }
+        // A host span on the same iteration stays out of the breakdown, as it always has.
+        iteration.spans.push_back(cadence::TraceSpan{"loop", cadence::ScopeKind::Host, 1.0, 0, 0});
+
+        std::ostringstream out;
+        cadence::detail::WriteWorstIterations(out, {iteration}, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+
+        // Repeats fold into one entry carrying their total and their count: 3 x 100us of the widest stage.
+        CHECK(text.find("stage9 300us x3") != std::string::npos);
+        CHECK(text.find("stage8 270us x3") != std::string::npos);
+        // Widest first, so the answer is at the front of the line.
+        CHECK(text.find("stage9") < text.find("stage8"));
+        // Eight of the ten survive the cap, and the two narrowest are counted rather than printed.
+        CHECK(text.find("+2 more") != std::string::npos);
+        CHECK(text.find("stage0") == std::string::npos);
+        CHECK(text.find("stage1 ") == std::string::npos);
+        CHECK(text.find("loop") == std::string::npos);
+        // One line for the iteration, and it stays short enough to read.
+        CHECK(std::count(text.begin(), text.end(), '\n') == 3);
+
+        // A stage that ran once is still printed without a count, which is the shape every single-stage loop produces.
+        cadence::TraceIteration plain;
+        plain.spanMs = 0.05;
+        plain.spans.push_back(cadence::TraceSpan{"saxpy", cadence::ScopeKind::Device, 0.04, 0, 1});
+        std::ostringstream single;
+        cadence::detail::WriteWorstIterations(single, {plain}, false, cadence::detail::Theme{});
+        CHECK(single.str().find("saxpy 40.0us") != std::string::npos);
+        CHECK(single.str().find(" x") == std::string::npos);
+    }
+
+    // Iterations are ranked by whichever span actually covers the pass. A loop that queues asynchronous work and synchronizes elsewhere has a host scope that returns in microseconds against milliseconds of GPU time, and ranking those by the host span ranks them by host jitter: the llama.cpp run retained an iteration for 18.9us of host noise while the slowest GPU pass in the run never appeared.
+    void TestWorstIterationsRankByTheLongerOfHostAndDevice() {
+        std::vector<cadence::detail::IterationSpan> queued;
+        queued.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Host, 0.008, 0, 0});
+        queued.push_back(cadence::detail::IterationSpan{1, cadence::ScopeKind::Device, 3.93, 0, 1});
+        CHECK_NEAR(cadence::detail::IterationSpanMs(queued), 3.93, 1e-9);
+
+        // The ordinary shape, where the loop scope does enclose its GPU work, is unchanged: the host span is the larger of the two by construction.
+        std::vector<cadence::detail::IterationSpan> enclosed;
+        enclosed.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Host, 5.0, 0, 0});
+        enclosed.push_back(cadence::detail::IterationSpan{1, cadence::ScopeKind::Device, 2.0, 0, 1});
+        enclosed.push_back(cadence::detail::IterationSpan{2, cadence::ScopeKind::Device, 1.0, 0, 1});
+        CHECK_NEAR(cadence::detail::IterationSpanMs(enclosed), 5.0, 1e-9);
+
+        // Device-only, which has no host span to prefer in the first place.
+        std::vector<cadence::detail::IterationSpan> deviceOnly;
+        deviceOnly.push_back(cadence::detail::IterationSpan{0, cadence::ScopeKind::Device, 2.0, 0, 1});
+        CHECK_NEAR(cadence::detail::IterationSpanMs(deviceOnly), 2.0, 1e-9);
+    }
+
+    // Two GPUs running the same label must not share a row. Averaging them answers a question nobody asked: the reason to look at two cards is that one of them is slower.
+    void TestDeviceSamplesKeyByDevice() {
+        cadence::detail::LabelSamples samples;
+        cadence::detail::SlotFor(samples, 7, 1).gpu.Add(2.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 0).gpu.Add(1.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 1).gpu.Add(4.0, 0.0, 0);
+        cadence::detail::SlotFor(samples, 7, 0).issue.Add(0.5, 0.0, 0);
+
+        // Two slots, not three and not one, and ordered by device id however they arrived.
+        CHECK(samples.devices.size() == 2);
+        CHECK(samples.devices[0].device == 0);
+        CHECK(samples.devices[1].device == 1);
+        CHECK(samples.devices[0].gpu.count == 1);
+        CHECK(samples.devices[1].gpu.count == 2);
+        CHECK_NEAR(samples.devices[0].gpu.mean, 1.0, 1e-9);
+        CHECK_NEAR(samples.devices[1].gpu.mean, 3.0, 1e-9);
+        // The issue side is keyed the same way and stays on its own device.
+        CHECK(samples.devices[0].issue.count == 1);
+        CHECK(samples.devices[1].issue.count == 0);
+        // Distinct seeds, so two cards do not thin their reservoirs in lockstep.
+        CHECK(samples.devices[0].gpu.rngState != samples.devices[1].gpu.rngState);
+    }
+
+    // The device column costs a reader nothing to ignore but everything to misread, so it appears only when there is a second GPU to tell apart.
+    void TestDeviceColumnAppearsOnlyWithSeveralDevices() {
+        const std::vector<double> fast = {1.0, 1.1, 1.2};
+        const std::vector<double> slow = {4.0, 4.1, 4.2};
+
+        std::vector<cadence::Stats> single = {
+            MakeRow("saxpy", cadence::ScopeKind::Device, 0, fast),
+            MakeRow("iteration", cadence::ScopeKind::Host, -1, slow),
+        };
+        const std::string one = RenderTable(single);
+        CHECK(one.find(" dev ") == std::string::npos);
+
+        std::vector<cadence::Stats> several = single;
+        several.push_back(MakeRow("saxpy", cadence::ScopeKind::Device, 1, slow));
+        const std::string two = RenderTable(several);
+        CHECK(two.find("scope   dev  n") != std::string::npos);
+        CHECK(two.find("saxpy      device    0  3") != std::string::npos);
+        CHECK(two.find("saxpy      device    1  3") != std::string::npos);
+        // A plain host span belongs to no GPU, so its cell stays blank rather than claiming device 0.
+        CHECK(two.find("iteration  host         3") != std::string::npos);
+    }
+
+    // With one label on several GPUs every one of its rows carries the deadline, and there is one line to spend. A verdict that reads "met" while another card missed is the most misleading thing this report could print.
+    void TestBudgetLineNamesTheWorstDevice() {
+        std::vector<cadence::Stats> rows = {
+            MakeRow("infer", cadence::ScopeKind::Device, 0, {1.0, 1.1, 1.2}, 2.0),
+            MakeRow("infer", cadence::ScopeKind::Device, 1, {1.0, 3.0, 4.0}, 2.0),
+        };
+        std::ostringstream out;
+        cadence::detail::WriteBudget(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("on device 1, the worst of 2") != std::string::npos);
+        CHECK(text.find("1/3 iterations inside budget") != std::string::npos);
+
+        // Sorting the misses later must not change the verdict; the row is chosen, not taken last.
+        std::swap(rows[0], rows[1]);
+        std::ostringstream reordered;
+        cadence::detail::WriteBudget(reordered, rows, false, cadence::detail::Theme{});
+        CHECK(reordered.str() == text);
+    }
+
+    // A verdict of MISSED beside a share of 100.0% is the confusion the deadline line exists to prevent, and a long run is exactly where rounding produces it.
+    void TestNearPerfectShareDoesNotRoundToWhole() {
+        std::vector<double> samples(3157, 1.0);
+        samples[0] = 3.0;  // One miss in 3157 is 99.968%, which rounds up.
+        std::vector<cadence::Stats> rows = {MakeRow("loop", cadence::ScopeKind::Host, -1, samples, 2.0)};
+        std::ostringstream out;
+        cadence::detail::WriteBudget(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("MISSED") != std::string::npos);
+        CHECK(text.find("3156/3157 iterations inside budget (99.9%)") != std::string::npos);
+        CHECK(text.find("100.0%") == std::string::npos);
+
+        // And a run that genuinely held every iteration still reads as a whole 100.0%.
+        std::vector<cadence::Stats> clean = {MakeRow("loop", cadence::ScopeKind::Host, -1, std::vector<double>(64, 1.0), 2.0)};
+        std::ostringstream perfect;
+        cadence::detail::WriteBudget(perfect, clean, false, cadence::detail::Theme{});
+        CHECK(perfect.str().find("64/64 iterations inside budget (100.0%)") != std::string::npos);
+    }
+
+    // Two GPUs run at the same time, so adding their spans together produces a duration no iteration ever took -- one that would grow with every card added while the loop got faster.
+    void TestSummaryTotalsPerDevice() {
+        std::vector<cadence::Stats> rows = {
+            MakeRow("saxpy", cadence::ScopeKind::Device, 0, {1.0, 1.0, 1.0}),
+            MakeRow("scale", cadence::ScopeKind::Device, 0, {2.0, 2.0, 2.0}),
+            MakeRow("saxpy", cadence::ScopeKind::Device, 1, {4.0, 4.0, 4.0}),
+            MakeRow("iteration", cadence::ScopeKind::Host, -1, {20.0, 20.0, 20.0}),
+        };
+        std::ostringstream out;
+        cadence::detail::WriteSummary(out, rows, false, cadence::detail::Theme{});
+        const std::string text = out.str();
+        CHECK(text.find("3.00ms per iteration across 2 label(s) on device 0") != std::string::npos);
+        CHECK(text.find("4.00ms per iteration across 1 label(s) on device 1") != std::string::npos);
+        CHECK(text.find("7.00ms") == std::string::npos);
+        // The remainder is launch and synchronization only while there is one GPU to subtract, so with several the line is withheld rather than guessed at.
+        CHECK(text.find("launch and synchronization") == std::string::npos);
+
+        // With a single device it reads exactly as it always did.
+        rows.erase(rows.begin() + 2);
+        std::ostringstream one;
+        cadence::detail::WriteSummary(one, rows, false, cadence::detail::Theme{});
+        const std::string single = one.str();
+        CHECK(single.find("3.00ms per iteration across 2 label(s)") != std::string::npos);
+        CHECK(single.find("on device") == std::string::npos);
+        CHECK(single.find("launch and synchronization") != std::string::npos);
     }
 
     void TestBudgetCountsMisses() {
@@ -837,6 +947,11 @@ int main() {
         {"worst iterations rank by the longer span", TestWorstIterationsRankByTheLongerOfHostAndDevice},
         {"trace lanes are distinct threads", TestTraceLanesAreDistinctThreads},
         {"trace json shape", TestTraceJsonShape},
+        {"device samples key by device", TestDeviceSamplesKeyByDevice},
+        {"device column appears only with several devices", TestDeviceColumnAppearsOnlyWithSeveralDevices},
+        {"budget line names the worst device", TestBudgetLineNamesTheWorstDevice},
+        {"summary totals per device", TestSummaryTotalsPerDevice},
+        {"near-perfect share does not round to whole", TestNearPerfectShareDoesNotRoundToWhole},
         {"budget counts misses", TestBudgetCountsMisses},
         {"budget target selection", TestBudgetTargetSelection},
         {"reset", TestResetClearsEverything},
