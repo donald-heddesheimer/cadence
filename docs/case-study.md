@@ -153,7 +153,9 @@ against 228.20 tok/s. Not a cadence result, but it fell out of the same runs.)
 ## Three defects this turned up in cadence
 
 None of these are visible on a loop with a handful of stages, which is the only
-shape the tests and benchmarks have ever covered.
+shape the tests and benchmarks had ever covered. All three are described below as
+they were found, and all three are now fixed — each with a regression test that
+was checked to fail with its own fix reverted.
 
 **1. The summary line states a conclusion that is the opposite of the truth.**
 On the per-op run the report ends:
@@ -168,13 +170,20 @@ correct only when each label occurs once per iteration; here `MUL_MAT` occurs 17
 times per token. Weighting each mean by its actual occurrence rate gives 5.4 ms of
 device work per iteration, not 205 µs. The line is not merely imprecise — it
 confidently reports the single most important fact about this workload backwards.
-The fix is to weight by `count / iterations`, which cadence already knows, or to
-withhold the line when a label's count exceeds the iteration count.
+
+*Fixed:* each mean is now weighted by `count / iterations`. The denominator is the
+observation count of the single pure-host label, which is the loop body and ran
+once per pass by construction. Without one there is no denominator, so the sum of
+the means is now labelled as exactly that and the conclusion is withheld.
 
 **2. The worst-iteration breakdown is unbounded.** With ~250 spans in an
 iteration, `WriteWorstIterations` prints all of them on one line: a single
-unreadable paragraph several thousand characters long, three times over. It needs
-a cap and a "+N more".
+unreadable paragraph several thousand characters long, three times over.
+
+*Fixed:* spans are folded by label — `MUL_MAT 3.10ms x178`, which is the number
+worth reading anyway — sorted widest first, and cut to eight with a `+N more`.
+Folding before cutting is what makes the cut useful; cutting 250 raw spans to
+eight prints eight matrix multiplies.
 
 **3. Iterations are ranked by the wrong span when the host scope does not enclose
 the GPU work.** `IterationSpanMs` uses the longest host span as the iteration's
@@ -183,6 +192,10 @@ Here the host scope returns in 8 µs having queued 3.93 ms of GPU work, so the
 "slowest iterations" are chosen by host jitter: the run picked an iteration with
 an 18.9 µs host span and a perfectly ordinary 3.94 ms GPU span, while the actual
 worst GPU iteration (4.04 ms) never appeared.
+
+*Fixed:* the ranking now takes whichever of the longest host span and the total
+device time is larger. Where the loop scope does enclose its GPU work it is the
+larger of the two by construction, so the ordinary case is unchanged.
 
 ## One thing that is not a defect, but caught me anyway
 

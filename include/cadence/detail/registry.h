@@ -209,7 +209,6 @@ namespace cadence {
             const std::size_t numWorst = hotConfig.numWorstIterations.load(std::memory_order_relaxed);
 
             // Everything flushed here belongs to one pass of the caller's loop, which is what makes a flush boundary the natural definition of an iteration. Spans are gathered into a member buffer rather than a local one so that the steady state, where an iteration is measured and then found not to be among the worst, allocates nothing.
-            bool sawHostScope = false;
             const std::uint64_t iterationIndex = flushGeneration_.load(std::memory_order_relaxed) - 1;
 
 #if CADENCE_HAS_CUDA
@@ -292,7 +291,6 @@ namespace cadence {
                                 span.startNs = record.startNs;
                                 span.lane = 0;
                                 iterationSpans_.push_back(span);
-                                sawHostScope = true;
                             }
                         } else {
                             ++stalledClockRecords_;
@@ -302,7 +300,7 @@ namespace cadence {
 
                 // Inside the lock, because this is where worst_ is written and Snapshot reads it from another thread.
                 if (numWorst > 0 && !iterationSpans_.empty()) {
-                    RetainIfWorst(iterationIndex, IterationSpanMs(iterationSpans_, sawHostScope), numWorst);
+                    RetainIfWorst(iterationIndex, IterationSpanMs(iterationSpans_), numWorst);
                 }
             }
 

@@ -279,25 +279,15 @@ namespace cadence {
         }
     }
 
-    // The one line of arithmetic every reader of this report does by hand. Summing the device means gives GPU time per iteration; a label that recorded host time but no device time is a plain CADENCE_SCOPE, and when exactly one of those covers at least as much time as the GPU work it is almost certainly the loop body, which makes the remainder launch and synchronization overhead.
+    // The one line of arithmetic every reader of this report does by hand, and the only place cadence states a conclusion instead of a measurement.
+    //
+    // A label that recorded host time but no device time is a plain CADENCE_SCOPE, and when exactly one of those exists it is the loop body: it ran once per pass by construction, so its observation count is the number of iterations measured. That is the denominator the rest of this needs.
+    //
+    // GPU time per iteration is then each device label's mean weighted by how often that label ran per iteration, which is its own count over that denominator. Summing the unweighted means is only correct when every label fires exactly once per pass, and a graph executor breaks that badly: instrumenting llama.cpp's decode filed 178 matrix multiplies per token under one label, which contributed one mean, and this line reported a workload that is 99.8% GPU-bound as 7.3% GPU-bound. Not imprecise -- backwards, in the one sentence of the report a reader is most likely to quote. docs/case-study.md has the run.
+    //
+    // Without a loop scope there is no denominator, so the sum of the means is printed as exactly that and the conclusion drawn from it is withheld rather than guessed at.
     inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
-        // Totalled per GPU rather than over all of them, because two cards run at the same time: adding their spans together produces a duration no iteration ever took, and it would grow with every GPU added while the loop got faster.
-        struct DeviceTotal {
-            int device = -1;
-            double totalMs = 0.0;
-            std::size_t labels = 0;
-        };
-        std::vector<DeviceTotal> totals;
-        for (const Stats& row : stats) {
-            if (row.kind != ScopeKind::Device) continue;
-            std::size_t index = 0;
-            while (index < totals.size() && totals[index].device != row.device) ++index;
-            if (index == totals.size()) totals.push_back(DeviceTotal{row.device, 0.0, 0});
-            totals[index].totalMs += row.meanMs;
-            ++totals[index].labels;
-        }
-        if (totals.empty()) return;
-
+        // The denominator, resolved first because everything below is a rate against it.
         const Stats* span = nullptr;
         std::size_t hostOnlyLabels = 0;
         for (const Stats& row : stats) {
@@ -309,19 +299,41 @@ namespace cadence {
             ++hostOnlyLabels;
             span = &row;
         }
+        const bool haveIterations = hostOnlyLabels == 1 && span != nullptr && span->count > 0;
+        const double iterations = haveIterations ? static_cast<double>(span->count) : 0.0;
+
+        // Totalled per GPU rather than over all of them, because two cards run at the same time: adding their spans together produces a duration no iteration ever took, and it would grow with every GPU added while the loop got faster. Each card's own row count is what gets weighted, so a label that runs more often on one card than another is charged to each correctly.
+        struct DeviceTotal {
+            int device = -1;
+            double totalMs = 0.0;
+            std::size_t labels = 0;
+        };
+        std::vector<DeviceTotal> totals;
+        for (const Stats& row : stats) {
+            if (row.kind != ScopeKind::Device) continue;
+            std::size_t index = 0;
+            while (index < totals.size() && totals[index].device != row.device) ++index;
+            if (index == totals.size()) totals.push_back(DeviceTotal{row.device, 0.0, 0});
+            const double perIteration = haveIterations ? static_cast<double>(row.count) / iterations : 1.0;
+            totals[index].totalMs += row.meanMs * perIteration;
+            ++totals[index].labels;
+        }
+        if (totals.empty()) return;
 
         // Keys line up with the provenance block above, which uses the same eight-wide column.
         std::string key = "device";
         PadTo(key, 8);
         for (const DeviceTotal& total : totals) {
-            out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(total.totalMs, unicode) << " across " << total.labels << " label(s)";
+            out << "\n  " << theme.key << key << theme.reset << "  " << FormatDuration(total.totalMs, unicode)
+                << (haveIterations ? " per iteration across " : " across ") << total.labels << " label(s)"
+                << (haveIterations ? "" : ", one mean each");
             if (totals.size() > 1 && total.device >= 0) out << " on device " << total.device;
             out << "\n";
         }
 
-        // The remainder is launch and synchronization only while there is one GPU to subtract. With several running concurrently the loop span is not the sum of their work plus overhead, and there is no arithmetic here that would make it one, so the line is withheld rather than guessed at.
+        // The remainder is launch and synchronization only while there is one GPU to subtract. With several running concurrently the loop span is not the sum of their work plus overhead, and there is no arithmetic here that would make it one, so the line is withheld rather than guessed at -- as it is when there was no loop scope to count iterations against in the first place.
         const double deviceTotalMs = totals.front().totalMs;
-        if (totals.size() == 1 && hostOnlyLabels == 1 && span != nullptr && span->meanMs >= deviceTotalMs) {
+        if (totals.size() == 1 && haveIterations && span->meanMs >= deviceTotalMs) {
             const double overheadMs = span->meanMs - deviceTotalMs;
             char share[32];
             std::snprintf(share, sizeof(share), "%.1f%%", 100.0 * deviceTotalMs / span->meanMs);
@@ -401,14 +413,36 @@ namespace cadence {
             PadTo(head, 10);
             out << theme.accent << head << theme.reset << RightAligned(FormatDuration(iteration.spanMs, unicode), 8) << "  ";
             // Device spans only. The host-issue side of each label is carried for the trace, where seeing a launch sit ahead of its kernel is the point, but repeating it here would say what the summary table already said.
-            bool firstSpan = true;
+            //
+            // Folded by label and then cut to the widest few, because this line is read, not parsed. One span per stage is the shape this was written for, but a graph executor hands over hundreds: instrumenting llama.cpp per node put roughly 250 spans on one line, several thousand characters of it, three times over, and nothing could be read out of it. Folding first is what makes the cut cheap -- 178 matrix multiplies become one entry carrying their total, which is the number the reader wanted anyway, rather than 178 entries of which eight survive.
+            struct FoldedStage {
+                std::string label;
+                double totalMs = 0.0;
+                std::size_t occurrences = 0;
+            };
+            std::vector<FoldedStage> folded;
             for (const TraceSpan& span : iteration.spans) {
                 if (span.kind != ScopeKind::Device) continue;
-                if (!firstSpan) out << (unicode ? " \xc2\xb7 " : " | ");  // U+00B7 MIDDLE DOT
-                firstSpan = false;
-                out << span.label << " " << FormatDuration(span.durationMs, unicode);
+                auto found = std::find_if(folded.begin(), folded.end(), [&](const FoldedStage& stage) { return stage.label == span.label; });
+                if (found == folded.end()) {
+                    folded.push_back(FoldedStage{span.label, span.durationMs, 1});
+                } else {
+                    found->totalMs += span.durationMs;
+                    ++found->occurrences;
+                }
             }
-            if (firstSpan) out << "no GPU work recorded";
+            // Widest first: the question this section answers is where the time went, and the answer belongs at the front of the line rather than somewhere along it. Stable, so stages that ran for the same length stay in the order they ran.
+            std::stable_sort(folded.begin(), folded.end(), [](const FoldedStage& left, const FoldedStage& right) { return left.totalMs > right.totalMs; });
+
+            constexpr std::size_t NUM_STAGES_SHOWN = 8;
+            const std::size_t shown = folded.size() < NUM_STAGES_SHOWN ? folded.size() : NUM_STAGES_SHOWN;
+            for (std::size_t entry = 0; entry < shown; ++entry) {
+                if (entry > 0) out << (unicode ? " \xc2\xb7 " : " | ");  // U+00B7 MIDDLE DOT
+                out << folded[entry].label << " " << FormatDuration(folded[entry].totalMs, unicode);
+                if (folded[entry].occurrences > 1) out << " x" << folded[entry].occurrences;
+            }
+            if (folded.empty()) out << "no GPU work recorded";
+            if (folded.size() > shown) out << (unicode ? " \xc2\xb7 " : " | ") << "+" << (folded.size() - shown) << " more";
             out << "\n";
         }
     }

@@ -31,7 +31,7 @@ while (running) {
 CADENCE_REPORT();
 ```
 
-![cadence report: a table of per-label latency distributions with a histogram column, a deadline verdict reading MISSED on 185 of 190 iterations, and a breakdown of the three slowest iterations by stage](docs/report.svg)
+![cadence report: a table of per-label latency distributions with a histogram column, a deadline verdict reading MISSED with most but not all of the 190 iterations inside budget, and a breakdown of the three slowest iterations by stage](docs/report.svg)
 
 Reading it:
 
