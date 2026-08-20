@@ -85,7 +85,9 @@ the same instrumentation shows up on the Nsight timeline for free.
 - **Distributions, not averages.** mean, min, p50, p95, max, stddev, jitter.
 - **Bounded sampling.** Past the retention cap, count, mean, stddev, min, max,
   and deadline results remain exact. Percentiles and histograms are estimated
-  from a uniform sample of the full run.
+  from a uniform sample of the full run. `sampleEvery` is a separate trade: it
+  measures one iteration in N, so every figure, the deadline count included,
+  describes the sampled iterations rather than the whole run.
 - **Color for interactive output.** Auto-detected and disabled by `NO_COLOR`;
   redirected output and `outputPath` remain plain text.
 - **CPU and GPU through one API.** Host timers compile in translation units with

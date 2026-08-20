@@ -186,10 +186,10 @@ larger of the two by construction, so the ordinary case is unchanged.
 `CADENCE_KERNEL` resolves its label through a function-local `static`, so the
 handle is interned once per *call site*, not once per execution. Passing a label
 that varies — `ggml_op_name(node->op)` — files every scope under whichever op ran
-first, silently. The headers do say this (`ScopedHost`: "Interns on every
-construction"; the macro: "the only form that resolves a label once per call site
-rather than once per execution"), and the correct form for a runtime label is the
-class directly:
+first, silently. Both headers document the behavior — `ScopedHost` notes that it
+interns on every construction, and `CADENCE_KERNEL` notes that it caches the
+label per call site — and the correct form for a runtime label is the class
+directly:
 
 ```cpp
 cadence::ScopedKernel scope(ggml_op_name(node->op), cuda_ctx->stream());
