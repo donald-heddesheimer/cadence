@@ -2,6 +2,7 @@
 
 Time the stages of a CUDA loop from inside your own process. Header-only, C++17.
 
+![status](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)
 [![ci](https://github.com/donald-heddesheimer/cadence/actions/workflows/ci.yml/badge.svg)](https://github.com/donald-heddesheimer/cadence/actions/workflows/ci.yml)
 [![coverage](https://codecov.io/gh/donald-heddesheimer/cadence/branch/main/graph/badge.svg)](https://codecov.io/gh/donald-heddesheimer/cadence)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
