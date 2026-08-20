@@ -921,6 +921,81 @@ namespace {
         cadence::Reset();
     }
 
+    // CADENCE_ITERATION replaces a hand-placed CADENCE_FLUSH(); nothing here calls Flush().
+    void TestIterationScopeRecordsAndFlushes() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        for (int i = 0; i < 8; ++i) {
+            CADENCE_ITERATION("loop");
+            BurnBriefly();
+        }
+
+        bool found = false;
+        const cadence::Stats row = Find("loop", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 8);
+    }
+
+    // The span has to close before the flush it triggers, or the loop scope lands in the next iteration.
+    void TestIterationScopeGroupsTheBodyWithItsOwnSpan() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.numWorstIterations = 1;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 1; i <= 3; ++i) {
+            CADENCE_ITERATION("loop");
+            registry.RecordHost("stage", static_cast<double>(i));
+            BurnBriefly();
+        }
+
+        const std::vector<cadence::TraceIteration> worst = cadence::WorstIterations();
+        CHECK(worst.size() == 1);
+        bool sawLoop = false;
+        bool sawStage = false;
+        for (const cadence::TraceSpan& span : worst[0].spans) {
+            if (span.label == "loop") sawLoop = true;
+            if (span.label == "stage") sawStage = true;
+        }
+        CHECK(sawLoop);
+        CHECK(sawStage);
+    }
+
+    // Sampling skips the span, never the flush, so records made inside still resolve every iteration.
+    void TestIterationScopeFlushesEvenWhenSampledOut() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.sampleEvery = 4;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 0; i < 8; ++i) {
+            CADENCE_ITERATION("loop");
+            registry.RecordHost("stage", 1.0);
+        }
+
+        bool found = false;
+        const cadence::Stats loop = Find("loop", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(loop.count == 2);
+        const cadence::Stats stage = Find("stage", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(stage.count == 8);
+
+        config.sampleEvery = 1;
+        cadence::Configure(config);
+        cadence::Reset();
+    }
+
     struct TestCase {
         const char* name;
         void (*run)();
@@ -963,6 +1038,9 @@ int main() {
         {"label interning merges by content", TestLabelInterningMergesByContent},
         {"interned handles survive table growth", TestInternedHandlesSurviveTableGrowth},
         {"sampling keeps every nth", TestSamplingKeepsEveryNth},
+        {"iteration scope records and flushes", TestIterationScopeRecordsAndFlushes},
+        {"iteration scope groups the body with its span", TestIterationScopeGroupsTheBodyWithItsOwnSpan},
+        {"iteration scope flushes when sampled out", TestIterationScopeFlushesEvenWhenSampledOut},
     };
 
     for (const TestCase& test : tests) {

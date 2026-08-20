@@ -20,13 +20,12 @@ capture step.
 #include <cadence/cadence.h>
 
 while (running) {
-  CADENCE_SCOPE("iteration");                                 // CPU span
-
+  CADENCE_ITERATION("iteration");                             // CPU span, resolved
+                                                              // when it goes out of scope
   { CADENCE_KERNEL("saxpy", stream); Saxpy<<<...>>>(...); }   // GPU span
   { CADENCE_KERNEL("scale", stream); Scale<<<...>>>(...); }
 
   cudaStreamSynchronize(stream);
-  CADENCE_FLUSH();          // once per iteration, never between scopes
 }
 CADENCE_REPORT();
 ```
@@ -126,10 +125,13 @@ Or copy `include/cadence` onto your include path and skip CMake entirely.
 | `CADENCE_KERNEL("label", stream)` | GPU span, paired CUDA events | 3390 |
 | `CADENCE_STAGE("label", stream)` | GPU span, one event, chained to the previous stage | 2410 |
 | `CADENCE_SCOPE("label")` | CPU span, `steady_clock` | 330 |
+| `CADENCE_ITERATION("label")` | CPU span over the loop body, then flushes | once per loop |
 | `CADENCE_FLUSH()` | resolves pending records; synchronizes | once per loop |
 | `CADENCE_REPORT()` | flush, then print the report | once per run |
 
-`stream` is optional and defaults to the default stream.
+`stream` is optional and defaults to the default stream. Prefer
+`CADENCE_ITERATION` to a hand-placed `CADENCE_FLUSH()`: a flush is only correct
+once per iteration and never between scopes, and the scope enforces that.
 
 ```cpp
 cadence::Config cfg;

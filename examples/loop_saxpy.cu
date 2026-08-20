@@ -63,23 +63,19 @@ int main() {
     const int numBlocks = (NUM_ELEMENTS + NUM_THREADS_PER_BLOCK - 1) / NUM_THREADS_PER_BLOCK;
 
     for (int iteration = 0; iteration < NUM_ITERATIONS; ++iteration) {
+        // Times the loop body and resolves it when the scope closes.
+        CADENCE_ITERATION("iteration");
+
         {
-            CADENCE_SCOPE("iteration");
-
-            {
-                CADENCE_KERNEL("saxpy", stream);
-                Saxpy<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream>>>(2.0f, deviceX, deviceY, NUM_ELEMENTS);
-            }
-            {
-                CADENCE_KERNEL("scale", stream);
-                Scale<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream>>>(0.5f, deviceY, NUM_ELEMENTS);
-            }
-
-            cudaStreamSynchronize(stream);
+            CADENCE_KERNEL("saxpy", stream);
+            Saxpy<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream>>>(2.0f, deviceX, deviceY, NUM_ELEMENTS);
+        }
+        {
+            CADENCE_KERNEL("scale", stream);
+            Scale<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream>>>(0.5f, deviceY, NUM_ELEMENTS);
         }
 
-        // Resolve the iteration after its synchronization boundary.
-        CADENCE_FLUSH();
+        cudaStreamSynchronize(stream);
     }
 
     if (!CudaOk(cudaGetLastError(), "kernel launch")) return 1;

@@ -124,11 +124,18 @@ namespace cadence {
 #if CADENCE_ENABLED
 #define CADENCE_SCOPE(label) \
     ::cadence::ScopedHost CADENCE_DETAIL_UNIQUE(cadenceHostScope_)(CADENCE_DETAIL_LABEL(label))
+
+// Loop body span that flushes when it closes. Safer than a hand-placed
+// CADENCE_FLUSH(), which is only correct once per iteration.
+#define CADENCE_ITERATION(label)                                         \
+    ::cadence::ScopedIteration CADENCE_DETAIL_UNIQUE(cadenceIteration_)( \
+        CADENCE_DETAIL_LABEL(label))
 #define CADENCE_FLUSH() ::cadence::Flush()
 #define CADENCE_REPORT() ::cadence::Report()
 #define CADENCE_CONFIGURE(config) ::cadence::Configure(config)
 #else
 #define CADENCE_SCOPE(label) ((void)0)
+#define CADENCE_ITERATION(label) ((void)0)
 #define CADENCE_FLUSH() ((void)0)
 #define CADENCE_REPORT() ((void)0)
 #define CADENCE_CONFIGURE(config) ((void)0)
