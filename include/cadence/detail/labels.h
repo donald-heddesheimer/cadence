@@ -7,6 +7,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -75,13 +76,24 @@ namespace cadence {
         std::unordered_map<std::string, LabelId> ids_;
     };
 
+    // Rejects a label the macros cannot cache safely. Arrays pass; a pointer computed at runtime does not.
+    template <typename T>
+    constexpr const char* RequireLiteralLabel(T&& label) {
+        static_assert(std::is_array<std::remove_reference_t<T>>::value,
+                      "cadence: a macro label must be a string literal. The macro interns it once per call site, "
+                      "so a label that varies would file every scope under its first value. Use cadence::ScopedHost "
+                      "or cadence::ScopedKernel directly for a runtime label.");
+        return label;
+    }
+
     }  // namespace detail
 }  // namespace cadence
 
 // Resolve a label once per call site using thread-safe static initialization.
-#define CADENCE_DETAIL_LABEL(label)                                  \
-    ([]() -> const ::cadence::detail::LabelHandle& {                 \
-        static const ::cadence::detail::LabelHandle handle =         \
-            ::cadence::detail::LabelTable::Instance().Intern(label); \
-        return handle;                                               \
+#define CADENCE_DETAIL_LABEL(label)                             \
+    ([]() -> const ::cadence::detail::LabelHandle& {            \
+        static const ::cadence::detail::LabelHandle handle =    \
+            ::cadence::detail::LabelTable::Instance().Intern(   \
+                ::cadence::detail::RequireLiteralLabel(label)); \
+        return handle;                                          \
     }())

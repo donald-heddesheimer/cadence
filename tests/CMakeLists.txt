@@ -34,6 +34,18 @@ add_executable(cadence_self_contained
 target_link_libraries(cadence_self_contained PRIVATE cadence::cadence)
 add_test(NAME cadence_self_contained COMMAND cadence_self_contained)
 
+# A runtime label cannot be cached per call site, so the macros reject it. The
+# control build proves the negative test fails for the reason we think it does.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set(CADENCE_REJECT_CMD "${CMAKE_CXX_COMPILER}" -std=c++17 -fsyntax-only
+      -DCADENCE_HAS_CUDA=0 "-I${CMAKE_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/reject_runtime_label.cc")
+  add_test(NAME cadence_literal_label_compiles COMMAND ${CADENCE_REJECT_CMD})
+  add_test(NAME cadence_rejects_runtime_labels
+    COMMAND ${CADENCE_REJECT_CMD} -DCADENCE_TRY_RUNTIME_LABEL)
+  set_tests_properties(cadence_rejects_runtime_labels PROPERTIES WILL_FAIL TRUE)
+endif()
+
 # Device tests need a GPU as well as a compiler, so they are built when nvcc is
 # present and simply skip themselves at runtime when no device answers.
 if(CADENCE_HAVE_CUDA)

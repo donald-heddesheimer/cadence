@@ -33,13 +33,17 @@ namespace cadence {
         explicit ScopedHost(const char* label)
             : ScopedHost(detail::LabelTable::Instance().Intern(label)) {}
 
-        ~ScopedHost() {
+        // Closes the span. The destructor calls it; a second call records nothing.
+        void End() {
             if (!active_) return;
+            active_ = false;
             const std::int64_t endNs = detail::NowNs();
             detail::ThreadState& state = detail::TlsState();
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pendingHost.push_back(detail::HostRecord{labelId_, startNs_, endNs - startNs_});
         }
+
+        ~ScopedHost() { End(); }
 
         ScopedHost(const ScopedHost&) = delete;
         ScopedHost& operator=(const ScopedHost&) = delete;
@@ -49,6 +53,25 @@ namespace cadence {
         bool active_;
         detail::NvtxRange nvtx_;
         std::int64_t startNs_ = 0;
+    };
+
+    // One loop iteration: a host span over the body that flushes when it closes, so CADENCE_FLUSH() need not be placed by hand.
+    class ScopedIteration {
+       public:
+        explicit ScopedIteration(const detail::LabelHandle& label) : span_(label) {}
+        explicit ScopedIteration(const char* label) : span_(label) {}
+
+        // The span closes before the flush, so the body lands in this iteration and is not charged for resolving it.
+        ~ScopedIteration() {
+            span_.End();
+            detail::Registry::Instance().Flush();
+        }
+
+        ScopedIteration(const ScopedIteration&) = delete;
+        ScopedIteration& operator=(const ScopedIteration&) = delete;
+
+       private:
+        ScopedHost span_;
     };
 
 #if CADENCE_HAS_CUDA

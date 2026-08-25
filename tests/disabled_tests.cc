@@ -18,6 +18,9 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     CADENCE_KERNEL("also-should-not-exist");
+    {
+        CADENCE_ITERATION("neither-should-this");
+    }
     CADENCE_FLUSH();
     CADENCE_REPORT();
 
