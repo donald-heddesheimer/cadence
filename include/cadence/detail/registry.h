@@ -223,8 +223,10 @@ namespace cadence {
                 for (const std::vector<DeviceRecord>& batch : deviceBatches) {
                     for (const DeviceRecord& record : batch) {
                         float elapsedMs = 0.0f;
+                        // A refused label has no row to fold into. It is screened out here rather than skipped outright because its events still belong to the pool and the return below has to run either way, and it is kept separate from `valid` so it is not counted as an event failure, which it is not.
+                        const bool usable = record.label != INVALID_LABEL_ID;
                         const bool valid =
-                            record.start && record.stop &&
+                            usable && record.start && record.stop &&
                             cudaEventElapsedTime(&elapsedMs, record.start, record.stop) == cudaSuccess;
                         if (valid) {
                             LabelSamples& samples = SamplesFor(record.label);
@@ -265,7 +267,7 @@ namespace cadence {
                                     }
                                 }
                             }
-                        } else if (record.start || record.stop) {
+                        } else if (usable && (record.start || record.stop)) {
                             ++failedRecords_;
                         }
                         const std::size_t index = record.device < 0 ? 0 : static_cast<std::size_t>(record.device);
@@ -277,6 +279,8 @@ namespace cadence {
 #endif
                 // A zero-length host span indicates a stalled monotonic clock.
                 for (const HostRecord& record : hostBatch) {
+                    // A refused label would index samples_ at INVALID_LABEL_ID, which is past the end of a vector that is only ever as long as the label table. No scope appends such a record today; the guard is what keeps that true if one ever does.
+                    if (record.label == INVALID_LABEL_ID) continue;
                     LabelSamples& samples = SamplesFor(record.label);
                     if (KeepSample(samples, warmup)) {
                         if (record.elapsedNs > 0) {
@@ -407,7 +411,7 @@ namespace cadence {
 #else
             const std::size_t captured = 0;
 #endif
-            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount(), captured, WorstIterations());
+            WriteReport(out, configCopy, QueryRunInfo(), Snapshot(), FailedRecordCount(), StalledClockCount(), captured, WorstIterations(), LabelTable::Instance().DroppedCount());
         }
 
         void WriteTraceTo(std::ostream& out) const { WriteTraceJson(out, WorstIterations()); }
@@ -420,6 +424,11 @@ namespace cadence {
             std::atexit(&Registry::AtExitHandler);
         }
 
+        // The standard streams are constructed before main and are not destroyed while the program runs, so an atexit handler may still write to them. Every other stream belongs to the caller, and nothing here can tell whether it is still alive.
+        static bool StreamOutlivesExit(const std::ostream* stream) {
+            return stream == &std::cout || stream == &std::cerr || stream == &std::clog;
+        }
+
         static void AtExitHandler() {
             Registry& registry = Instance();
             const Config config = registry.GetConfig();
@@ -430,7 +439,12 @@ namespace cadence {
             }
             // The CUDA runtime may already be shutting down; Flush() tolerates that and the report simply loses whatever was still pending.
             registry.Flush();
-            if (config.reportStream) registry.WriteTo(*config.reportStream);
+            if (config.reportStream && StreamOutlivesExit(config.reportStream)) {
+                registry.WriteTo(*config.reportStream);
+            } else if (config.reportStream) {
+                // Writing here would dereference a stream that may already be destroyed. Say so on std::cerr, which is still alive, rather than reporting into freed memory or failing silently.
+                std::cerr << "cadence: exit-time report skipped -- Config::reportStream is a stream cadence does not own and cannot prove is still alive at exit. Call cadence::Report() while it is in scope, set Config::outputPath, or set Config::writeOnExit = false to silence this.\n";
+            }
             if (!config.outputPath.empty()) {
                 std::ofstream out(config.outputPath);
                 if (out) registry.WriteTo(out);
@@ -568,7 +582,8 @@ namespace cadence {
         LabelSamples& SamplesFor(LabelId id) {
             if (id >= samples_.size()) {
                 const std::size_t first = samples_.size();
-                samples_.resize(id + 1);
+                // Widened before the increment: LabelId is 32 bits, so id + 1 on INVALID_LABEL_ID wraps to zero and turns the resize into a no-op followed by an out-of-bounds index. Callers screen that id out, and this makes the arithmetic safe rather than merely unreached.
+                samples_.resize(static_cast<std::size_t>(id) + 1);
                 for (std::size_t i = first; i <= id; ++i) {
                     samples_[i].host.rngState = 0xBF58476D1CE4E5B9ULL * (i + 1);
                 }
@@ -661,6 +676,8 @@ namespace cadence {
     // Defined out of line because it needs TlsState(), which needs Registry to be a complete type.
     inline void Registry::RecordHost(const char* label, double elapsedMs) {
         const LabelHandle handle = LabelTable::Instance().Intern(label);
+        // The table was full when this label first arrived, so there is no row to add to.
+        if (LabelDropped(handle)) return;
         const std::int64_t elapsedNs = static_cast<std::int64_t>(elapsedMs * 1e6);
         // Place caller-supplied durations immediately before the current time.
         const std::int64_t endNs = NowNs();

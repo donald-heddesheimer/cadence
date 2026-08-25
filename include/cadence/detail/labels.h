@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -10,6 +11,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "cadence/detail/config.h"
 
 namespace cadence {
     namespace detail {
@@ -40,6 +43,12 @@ namespace cadence {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto found = ids_.find(text);
             if (found != ids_.end()) return Handle(found->second);
+            // A label already in the table always resolves; only a new one can be refused, so a runaway label built at runtime cannot displace the ones the loop actually uses.
+            const std::size_t cap = hotConfig.maxLabels.load(std::memory_order_relaxed);
+            if (cap != 0 && names_.size() >= cap) {
+                dropped_.fetch_add(1, std::memory_order_relaxed);
+                return LabelHandle{};
+            }
             const LabelId id = static_cast<LabelId>(names_.size());
             names_.push_back(text);
             observations_.emplace_back(0);
@@ -64,6 +73,9 @@ namespace cadence {
             return observations_[id].load(std::memory_order_relaxed);
         }
 
+        // Intern calls refused because the table was already at Config::maxLabels. A macro call site interns once, so it contributes at most one; a scope constructed with a runtime label interns on every execution and contributes one each time.
+        std::size_t DroppedCount() const { return dropped_.load(std::memory_order_relaxed); }
+
        private:
         LabelTable() = default;
 
@@ -74,6 +86,8 @@ namespace cadence {
         std::deque<std::string> names_;
         std::deque<std::atomic<std::uint64_t>> observations_;
         std::unordered_map<std::string, LabelId> ids_;
+        // Atomic so the report can read it without taking the label lock.
+        std::atomic<std::size_t> dropped_{0};
     };
 
     // Rejects a label the macros cannot cache safely. Arrays pass; a pointer computed at runtime does not.
@@ -85,6 +99,9 @@ namespace cadence {
                       "or cadence::ScopedKernel directly for a runtime label.");
         return label;
     }
+
+    // True for a handle the table refused. Such a scope records nothing: there is no row for it to land in.
+    inline bool LabelDropped(const LabelHandle& handle) { return handle.id == INVALID_LABEL_ID; }
 
     }  // namespace detail
 }  // namespace cadence

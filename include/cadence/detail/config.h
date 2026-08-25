@@ -12,6 +12,9 @@ namespace cadence {
     // Default reservoir size per report row (256 KiB of doubles).
     inline constexpr std::size_t NUM_SAMPLES_RETAINED = 32768;
 
+    // Default ceiling on distinct labels. Far above any hand-instrumented loop, and low enough that a label built at runtime cannot exhaust memory before anyone notices.
+    inline constexpr std::size_t NUM_LABELS_MAX = 4096;
+
     // ANSI color policy for report output.
     enum class ColorMode { Auto, Always, Never };
 
@@ -22,7 +25,9 @@ namespace cadence {
         // Optional path for a copy of the text report.
         std::string outputPath;
 
-        // Report destination; nullptr suppresses stream output.
+        // Report destination for Report() and WriteReport(); nullptr suppresses stream output.
+        //
+        // The exit-time fallback writes here only for std::cout, std::cerr and std::clog, which are alive for the whole process. cadence does not own any other stream and cannot prove it is still alive once static destructors have run, so it skips it and says so on std::cerr. Call Report() while your stream is in scope, or set outputPath.
         std::ostream* reportStream = &std::cout;
 
         // Color terminals automatically; NO_COLOR disables color.
@@ -37,7 +42,7 @@ namespace cadence {
         // Runtime instrumentation gate. -DCADENCE_DISABLE removes it at compile time.
         bool enabled = true;
 
-        // Write a fallback report at process exit.
+        // Write a fallback report at process exit when Report() was never called. See reportStream for which destinations it can reach.
         bool writeOnExit = true;
 
         // Measure one observation in every N per label; 1 measures all of them.
@@ -52,6 +57,11 @@ namespace cadence {
         // Reservoir size per row. Zero retains all observations. Aggregates and
         // deadline counts remain exact when the reservoir is full.
         std::size_t maxSamplesPerLabel = NUM_SAMPLES_RETAINED;
+
+        // Distinct labels the process may intern. Zero removes the ceiling.
+        //
+        // A label first seen once the table is full records nothing, and DroppedLabelCount() counts the refusal. Folding it into an overflow row instead would blend unrelated work into one distribution that means nothing while still reading as authoritative.
+        std::size_t maxLabels = NUM_LABELS_MAX;
 
         // Number of slow iterations retained with their stage breakdowns.
         std::size_t numWorstIterations = 3;
@@ -70,6 +80,8 @@ namespace cadence {
         // Read by Flush(); budget changes apply only to later observations.
         std::atomic<double> budgetMs{0.0};
         std::atomic<std::size_t> maxSamplesPerLabel{NUM_SAMPLES_RETAINED};
+        // Read by Intern() under the label table's lock, so a label already in the table keeps resolving after the cap is reached.
+        std::atomic<std::size_t> maxLabels{NUM_LABELS_MAX};
         std::atomic<std::size_t> numWorstIterations{3};
         // Whether flush should place spans on an absolute timeline. Only a trace needs that, and it is not free, so the flush path reads this rather than the path string.
         std::atomic<bool> traceEnabled{false};
@@ -83,6 +95,7 @@ namespace cadence {
         hotConfig.sampleEvery.store(config.sampleEvery < 1 ? 1 : config.sampleEvery, std::memory_order_relaxed);
         hotConfig.budgetMs.store(config.budgetMs, std::memory_order_relaxed);
         hotConfig.maxSamplesPerLabel.store(config.maxSamplesPerLabel, std::memory_order_relaxed);
+        hotConfig.maxLabels.store(config.maxLabels, std::memory_order_relaxed);
         hotConfig.numWorstIterations.store(config.numWorstIterations, std::memory_order_relaxed);
         hotConfig.traceEnabled.store(!config.tracePath.empty(), std::memory_order_relaxed);
     }
@@ -100,7 +113,7 @@ namespace cadence {
         return fallback;
     }
 
-    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_COLOR, NO_COLOR, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES, CADENCE_WORST, CADENCE_TRACE.
+    // CADENCE_WARMUP, CADENCE_OUTPUT, CADENCE_NVTX, CADENCE_ENABLE, CADENCE_SAMPLE, CADENCE_UNICODE, CADENCE_COLOR, NO_COLOR, CADENCE_BUDGET_MS, CADENCE_BUDGET_LABEL, CADENCE_MAX_SAMPLES, CADENCE_MAX_LABELS, CADENCE_WORST, CADENCE_TRACE.
     inline void ApplyEnvironmentOverrides(Config& config) {
         if (const char* warmup = EnvOrNull("CADENCE_WARMUP")) {
             config.warmupIterations = static_cast<unsigned>(std::strtoul(warmup, nullptr, 10));
@@ -114,6 +127,9 @@ namespace cadence {
         }
         if (const char* retained = EnvOrNull("CADENCE_MAX_SAMPLES")) {
             config.maxSamplesPerLabel = static_cast<std::size_t>(std::strtoull(retained, nullptr, 10));
+        }
+        if (const char* labels = EnvOrNull("CADENCE_MAX_LABELS")) {
+            config.maxLabels = static_cast<std::size_t>(std::strtoull(labels, nullptr, 10));
         }
         if (const char* worst = EnvOrNull("CADENCE_WORST")) {
             config.numWorstIterations = static_cast<std::size_t>(std::strtoull(worst, nullptr, 10));

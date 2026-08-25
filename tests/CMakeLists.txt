@@ -14,6 +14,19 @@ target_link_libraries(cadence_disabled_tests PRIVATE cadence::cadence)
 target_compile_definitions(cadence_disabled_tests PRIVATE CADENCE_HAS_CUDA=0 CADENCE_DISABLE)
 add_test(NAME cadence_disabled_tests COMMAND cadence_disabled_tests)
 
+# The exit-time report runs after main returns, so a whole process is the only
+# place to observe it. One run proves a caller's stream is not written through
+# once it is gone; the other proves the ordinary std::cout path still reports.
+add_executable(cadence_exit_report exit_report_stream.cc)
+target_link_libraries(cadence_exit_report PRIVATE cadence::cadence)
+target_compile_definitions(cadence_exit_report PRIVATE CADENCE_HAS_CUDA=0)
+add_test(NAME cadence_exit_report_skips_foreign_stream COMMAND cadence_exit_report dangling)
+set_tests_properties(cadence_exit_report_skips_foreign_stream PROPERTIES
+  PASS_REGULAR_EXPRESSION "exit-time report skipped")
+add_test(NAME cadence_exit_report_writes_standard_stream COMMAND cadence_exit_report standard)
+set_tests_properties(cadence_exit_report_writes_standard_stream PROPERTIES
+  PASS_REGULAR_EXPRESSION "cadence report")
+
 # Every header has to compile on its own. A header-only library that only works
 # when you include its headers in one particular order is a trap, and this is
 # the cheapest possible way to never ship one.

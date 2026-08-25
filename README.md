@@ -147,8 +147,10 @@ cfg.numWorstIterations = 3;     // slowest iterations kept whole; 0 turns it off
 cfg.tracePath = "worst.json";   // Perfetto-openable timeline of those iterations
 cfg.sampleEvery = 1;            // measure one iteration in N
 cfg.maxSamplesPerLabel = 32768; // retained per row; 0 keeps every observation
+cfg.maxLabels = 4096;           // distinct labels; 0 removes the ceiling
 cfg.outputPath = "run.txt";     // also write the report here
 cfg.reportStream = &std::cerr;  // where it prints; nullptr suppresses printing
+cfg.writeOnExit = true;         // report at exit if Report() was never called
 cfg.unicodeOutput = false;      // ASCII table for terminals that mangle UTF-8
 cfg.colorOutput = cadence::ColorMode::Auto;  // Color terminal output automatically
 cadence::Configure(cfg);
@@ -161,6 +163,10 @@ Every field has an environment override (`CADENCE_WARMUP`, `CADENCE_BUDGET_MS`,
 `CADENCE_TRACE`, `CADENCE_ENABLE`, ...), so a deployed binary can be re-pointed
 without a rebuild. Set the budget before the loop starts: misses are counted as
 observations arrive, which is what keeps the verdict exact on a long run.
+
+`CADENCE_REPORT()` is the production lifecycle. The exit-time fallback exists so a short run still prints something, but it runs after `main` returns and can only reach destinations that are certainly still alive: `std::cout`, `std::cerr`, `std::clog`, and `outputPath`, which it opens itself. Point `reportStream` at a stream you own and the fallback will skip it and say so, because by then it may already be destroyed. Call `CADENCE_REPORT()` while that stream is in scope.
+
+`maxLabels` bounds the label table. A label first seen once the table is full records nothing rather than being folded into a shared overflow row, since one row blending unrelated stages reads as authoritative and means nothing. `cadence::DroppedLabelCount()` counts the refusals and the report names them. Hitting the ceiling almost always means a label is being built at runtime, which `CADENCE_SCOPE` cannot cache anyway.
 
 ## Overhead
 

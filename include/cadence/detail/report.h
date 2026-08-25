@@ -175,7 +175,7 @@ namespace cadence {
     }
 
     // Record the settings needed to interpret or reproduce a report.
-    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, bool anyEstimated, const Theme& theme) {
+    inline void WriteReportHeader(std::ostream& out, const Config& config, const RunInfo& info, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes, std::size_t droppedLabels, bool anyEstimated, const Theme& theme) {
         out << theme.title << "cadence report" << theme.reset << "\n";
         out << "  " << theme.key << "device" << theme.reset << "    " << info.deviceName;
         if (info.cudaAvailable) {
@@ -202,6 +202,11 @@ namespace cadence {
         if (capturedScopes > 0) {
             out << "  " << theme.warn << "WARNING" << theme.reset << "   " << capturedScopes << " "
                 << Plural(capturedScopes, "scope", "scopes") << " skipped during CUDA graph capture; instrument the graph launch instead\n";
+        }
+        if (droppedLabels > 0) {
+            out << "  " << theme.warn << "WARNING" << theme.reset << "   " << droppedLabels << " label "
+                << Plural(droppedLabels, "lookup", "lookups") << " refused -- the table holds " << config.maxLabels
+                << "; rows below are missing whatever those scopes measured. A label built at runtime is the usual cause\n";
         }
         if (anyEstimated) {
             // Identify the fields affected by reservoir sampling.
@@ -442,13 +447,13 @@ namespace cadence {
         }
     }
 
-    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0, const std::vector<TraceIteration>& worst = {}) {
+    inline void WriteReport(std::ostream& out, const Config& config, const RunInfo& info, const std::vector<Stats>& stats, std::size_t failedRecords, std::size_t stalledClockRecords, std::size_t capturedScopes = 0, const std::vector<TraceIteration>& worst = {}, std::size_t droppedLabels = 0) {
         const bool unicode = config.unicodeOutput;
         // Select color separately for terminal and file streams.
         const Theme theme = SelectTheme(out, config.colorOutput);
         bool anyEstimated = false;
         for (const Stats& row : stats) anyEstimated = anyEstimated || row.estimated;
-        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, anyEstimated, theme);
+        WriteReportHeader(out, config, info, failedRecords, stalledClockRecords, capturedScopes, droppedLabels, anyEstimated, theme);
         WriteStatsTable(out, stats, unicode, theme);
         WriteBudget(out, stats, unicode, theme);
         WriteWorstIterations(out, worst, unicode, theme);
