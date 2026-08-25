@@ -3,7 +3,9 @@
 #include <cadence/cadence.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -996,6 +998,207 @@ namespace {
         cadence::Reset();
     }
 
+    // Past the cap a new label is refused outright. Merging it into an overflow row would produce a distribution over unrelated work, which reads as authoritative and means nothing.
+    void TestLabelCapRefusesNewLabelsAndCountsThem() {
+        // The table is process-lifetime and never shrinks, so the cap has to be set relative to whatever earlier tests already interned.
+        const std::size_t internedBefore = cadence::detail::LabelTable::Instance().Count();
+        const std::size_t droppedBefore = cadence::DroppedLabelCount();
+
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.maxLabels = internedBefore + 2;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry::Instance().RecordHost("cap-first", 1.0);
+        cadence::detail::Registry::Instance().RecordHost("cap-second", 1.0);
+        cadence::detail::Registry::Instance().RecordHost("cap-refused", 1.0);
+        cadence::detail::Registry::Instance().RecordHost("cap-also-refused", 1.0);
+        cadence::Flush();
+
+        bool found = false;
+        Find("cap-first", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        Find("cap-second", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        Find("cap-refused", cadence::ScopeKind::Host, &found);
+        CHECK(!found);
+        CHECK(cadence::DroppedLabelCount() == droppedBefore + 2);
+        CHECK(cadence::detail::LabelTable::Instance().Count() == internedBefore + 2);
+
+        // A label already in the table has to keep resolving once the cap is reached, or a runaway runtime label would displace the ones the loop actually uses.
+        cadence::detail::Registry::Instance().RecordHost("cap-first", 1.0);
+        cadence::Flush();
+        const cadence::Stats row = Find("cap-first", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 2);
+
+        // Missing rows are worth saying out loud; a short report otherwise looks complete.
+        std::ostringstream out;
+        cadence::WriteReport(out);
+        CHECK(out.str().find("label lookups refused") != std::string::npos);
+
+        config.maxLabels = cadence::NUM_LABELS_MAX;
+        cadence::Configure(config);
+        cadence::Reset();
+    }
+
+    // Flush() indexes samples_ by label id, and a refused label indexes past the end of it. No scope appends such a record, which is exactly why this pushes one by hand: the guard has to survive someone later adding a path that does.
+    void TestFlushIgnoresRecordsWithARefusedLabel() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::ThreadState& state = cadence::detail::TlsState();
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pendingHost.push_back(cadence::detail::HostRecord{cadence::detail::INVALID_LABEL_ID, 0, 1000});
+        }
+        cadence::detail::Registry::Instance().RecordHost("survivor", 1.0);
+        cadence::Flush();
+
+        // Reaching this line at all is most of the test: unguarded, the read runs off the end of samples_.
+        bool found = false;
+        const cadence::Stats row = Find("survivor", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 1);
+        CHECK(cadence::Snapshot().size() == 1);
+    }
+
+    // Where the label cap meets CADENCE_ITERATION. A refused loop label has to lose its span and keep its flush, exactly as a sampled-out one does; suppressing the flush would strand every record made inside the loop.
+    void TestIterationScopeFlushesEvenWhenItsLabelIsRefused() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        registry.RecordHost("cap-stage", 1.0);
+        // Flushed before the reset on purpose: Reset() clears statistics, not the pending thread-local buffer, so an unflushed record here would survive and land in the first iteration below.
+        cadence::Flush();
+        // Seal the table at its current size so the loop label below cannot be interned.
+        config.maxLabels = cadence::detail::LabelTable::Instance().Count();
+        cadence::Configure(config);
+        cadence::Reset();
+
+        const std::size_t droppedBefore = cadence::DroppedLabelCount();
+        for (int i = 0; i < 5; ++i) {
+            CADENCE_ITERATION("cap-refused-loop");
+            registry.RecordHost("cap-stage", 1.0);
+        }
+
+        // Nothing here calls Flush(). If the refused label had suppressed the iteration's flush, this row would be empty.
+        bool found = false;
+        const cadence::Stats stage = Find("cap-stage", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(stage.count == 5);
+        Find("cap-refused-loop", cadence::ScopeKind::Host, &found);
+        CHECK(!found);
+        CHECK(cadence::DroppedLabelCount() == droppedBefore + 1);
+
+        config.maxLabels = cadence::NUM_LABELS_MAX;
+        cadence::Configure(config);
+        cadence::Reset();
+    }
+
+    // A thread can retire while Flush() is walking the thread list. Nothing it already recorded may be lost, and nothing may be counted twice.
+    void TestFlushRacesScopeDestructionAndThreadExit() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.numWorstIterations = 0;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        const std::size_t stalledBefore = cadence::StalledClockCount();
+
+        constexpr int NUM_THREADS = 4;
+        constexpr int NUM_SCOPES_PER_THREAD = 500;
+
+        // Flushing throughout is the point: threads retire underneath it.
+        std::atomic<bool> stop{false};
+        std::thread flusher([&stop] {
+            while (!stop.load(std::memory_order_relaxed)) cadence::Flush();
+        });
+
+        std::vector<std::thread> workers;
+        for (int t = 0; t < NUM_THREADS; ++t) {
+            workers.emplace_back([] {
+                for (int i = 0; i < NUM_SCOPES_PER_THREAD; ++i) {
+                    cadence::ScopedHost scope("raced");
+                    BurnBriefly();
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        stop.store(true, std::memory_order_relaxed);
+        flusher.join();
+        // Every worker has exited, so anything still pending sits on a retired ThreadState that PruneRetiredThreads must not have discarded.
+        cadence::Flush();
+
+        bool found = false;
+        const cadence::Stats row = Find("raced", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        // Conservation, allowing for the one documented loss: a span the monotonic clock did not advance across.
+        const std::size_t stalled = cadence::StalledClockCount() - stalledBefore;
+        CHECK(row.count + stalled == NUM_THREADS * NUM_SCOPES_PER_THREAD);
+    }
+
+    // Configure() and Reset() from another thread while scopes are recording. Reset() is destructive by design, so the invariant is not a count during the churn: it is that the registry accounts correctly again once the churn stops.
+    void TestConfigureAndResetDuringRecording() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        constexpr int NUM_THREADS = 3;
+        constexpr int NUM_SCOPES_PER_THREAD = 400;
+
+        std::atomic<bool> stop{false};
+        std::thread churn([&stop, config] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                cadence::Configure(config);
+                cadence::Reset();
+            }
+        });
+
+        std::vector<std::thread> workers;
+        for (int t = 0; t < NUM_THREADS; ++t) {
+            workers.emplace_back([] {
+                for (int i = 0; i < NUM_SCOPES_PER_THREAD; ++i) {
+                    cadence::ScopedHost scope("churned");
+                    BurnBriefly();
+                }
+                cadence::Flush();
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        stop.store(true, std::memory_order_relaxed);
+        churn.join();
+        cadence::Flush();
+
+        // Whatever survived the last Reset() has to be internally coherent: a row cannot hold more observations than were ever recorded, and its aggregates cannot be nonsense.
+        for (const cadence::Stats& row : cadence::Snapshot()) {
+            CHECK(row.count <= NUM_THREADS * NUM_SCOPES_PER_THREAD);
+            CHECK(row.meanMs >= 0.0);
+            CHECK(row.maxMs >= row.minMs);
+        }
+
+        // The real assertion: no state leaked from the raced Reset() into what comes next.
+        cadence::Reset();
+        for (int i = 0; i < 10; ++i) cadence::detail::Registry::Instance().RecordHost("after-churn", 1.0);
+        cadence::Flush();
+        bool found = false;
+        const cadence::Stats row = Find("after-churn", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(row.count == 10);
+    }
+
     struct TestCase {
         const char* name;
         void (*run)();
@@ -1041,6 +1244,11 @@ int main() {
         {"iteration scope records and flushes", TestIterationScopeRecordsAndFlushes},
         {"iteration scope groups the body with its span", TestIterationScopeGroupsTheBodyWithItsOwnSpan},
         {"iteration scope flushes when sampled out", TestIterationScopeFlushesEvenWhenSampledOut},
+        {"label cap refuses and counts", TestLabelCapRefusesNewLabelsAndCountsThem},
+        {"flush ignores records with a refused label", TestFlushIgnoresRecordsWithARefusedLabel},
+        {"iteration scope flushes when its label is refused", TestIterationScopeFlushesEvenWhenItsLabelIsRefused},
+        {"flush races scope destruction and thread exit", TestFlushRacesScopeDestructionAndThreadExit},
+        {"configure and reset during recording", TestConfigureAndResetDuringRecording},
     };
 
     for (const TestCase& test : tests) {

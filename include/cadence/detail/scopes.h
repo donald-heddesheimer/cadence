@@ -24,7 +24,7 @@ namespace cadence {
        public:
         explicit ScopedHost(const detail::LabelHandle& label)
             : labelId_(label.id),
-              active_(detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSample(label)),
+              active_(!detail::LabelDropped(label) && detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSample(label)),
               nvtx_(label.name, active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
             if (CADENCE_LIKELY(active_)) startNs_ = detail::NowNs();
         }
@@ -82,7 +82,8 @@ namespace cadence {
         explicit ScopedKernel(const detail::LabelHandle& label, cudaStream_t stream = 0)
             : labelId_(label.id),
               stream_(stream),
-              active_(detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
+              active_(!detail::LabelDropped(label) &&
+                      detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
                       detail::ShouldSample(label)),
               nvtx_(label.name,
                     active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
@@ -152,7 +153,8 @@ namespace cadence {
         explicit ScopedStage(const detail::LabelHandle& label, cudaStream_t stream = 0)
             : labelId_(label.id),
               stream_(stream),
-              active_(detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
+              active_(!detail::LabelDropped(label) &&
+                      detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
                       detail::ShouldSampleChain(label, stream)),
               nvtx_(label.name,
                     active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {

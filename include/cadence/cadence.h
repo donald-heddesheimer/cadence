@@ -50,6 +50,9 @@ namespace cadence {
     // Host spans dropped because the monotonic clock did not advance.
     inline std::size_t StalledClockCount() { return detail::Registry::Instance().StalledClockCount(); }
 
+    // Label lookups refused because the table reached Config::maxLabels. Nonzero means some scopes recorded nothing at all, so the report is missing rows rather than merely thinning them.
+    inline std::size_t DroppedLabelCount() { return detail::LabelTable::Instance().DroppedCount(); }
+
     // Scopes skipped during CUDA graph capture. Always zero without CUDA.
     inline std::size_t CapturedScopeCount() {
 #if CADENCE_HAS_CUDA
