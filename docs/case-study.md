@@ -199,7 +199,7 @@ Use the class directly whenever a label changes between executions.
 
 This footgun is now closed. The macros run their label through a compile-time
 check, so `CADENCE_KERNEL(ggml_op_name(node->op))` no longer builds; it reports
-that a macro label must be a literal and points at the class forms. The
+that a macro label must be a const character array and points at the class forms. The
 instrumentation above would not compile against the current header.
 
 ## Reproducing

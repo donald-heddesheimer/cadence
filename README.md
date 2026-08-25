@@ -133,10 +133,7 @@ Or copy `include/cadence` onto your include path and skip CMake entirely.
 `CADENCE_ITERATION` to a hand-placed `CADENCE_FLUSH()`: a flush is only correct
 once per iteration and never between scopes, and the scope enforces that.
 
-Macro labels must be string literals, and the compiler enforces it. A macro
-interns its label once per call site, so a label that varied would file every
-scope under whichever value ran first. Construct `cadence::ScopedHost` or
-`cadence::ScopedKernel` directly when the label is only known at runtime.
+Macro labels must be a string literal or another const character array, and the compiler enforces it. A macro interns its label once per call site, so a label whose characters can change would file every scope under whichever value ran first. That is why the check rejects a mutable `char[32]` as well as a pointer: both can be rewritten after the handle is cached. Construct `cadence::ScopedHost` or `cadence::ScopedKernel` directly when the label is only known at runtime.
 
 ```cpp
 cadence::Config cfg;

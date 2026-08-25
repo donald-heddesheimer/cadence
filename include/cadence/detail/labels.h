@@ -90,13 +90,17 @@ namespace cadence {
         std::atomic<std::size_t> dropped_{0};
     };
 
-    // Rejects a label the macros cannot cache safely. Arrays pass; a pointer computed at runtime does not.
+    // Rejects a label the macros cannot cache safely.
+    //
+    // The contract is that the characters do not change and outlive the flush, so the test is a const character array: a string literal, or any other const array. A mutable array fails, because nothing stops its contents being rewritten after the handle is cached. A pointer fails because its target is whatever it happened to point at the first time this call site ran. Keying on array-ness alone would let `char label[32]` through.
     template <typename T>
-    constexpr const char* RequireLiteralLabel(T&& label) {
-        static_assert(std::is_array<std::remove_reference_t<T>>::value,
-                      "cadence: a macro label must be a string literal. The macro interns it once per call site, "
-                      "so a label that varies would file every scope under its first value. Use cadence::ScopedHost "
-                      "or cadence::ScopedKernel directly for a runtime label.");
+    constexpr const char* RequireStableLabel(T&& label) {
+        using Label = std::remove_reference_t<T>;
+        static_assert(std::is_array<Label>::value && std::is_const<std::remove_extent_t<Label>>::value,
+                      "cadence: a macro label must be a string literal, or another const character array. The macro "
+                      "interns it once per call site, so a label whose contents can change would file every scope "
+                      "under its first value. Use cadence::ScopedHost or cadence::ScopedKernel directly for a label "
+                      "computed at runtime.");
         return label;
     }
 
@@ -111,6 +115,6 @@ namespace cadence {
     ([]() -> const ::cadence::detail::LabelHandle& {            \
         static const ::cadence::detail::LabelHandle handle =    \
             ::cadence::detail::LabelTable::Instance().Intern(   \
-                ::cadence::detail::RequireLiteralLabel(label)); \
+                ::cadence::detail::RequireStableLabel(label));  \
         return handle;                                          \
     }())
