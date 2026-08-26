@@ -129,9 +129,9 @@ Or copy `include/cadence` onto your include path and skip CMake entirely.
 | `CADENCE_FLUSH()` | resolves pending records; synchronizes | once per loop |
 | `CADENCE_REPORT()` | flush, then print the report | once per run |
 
-`stream` is optional and defaults to the default stream. Prefer
-`CADENCE_ITERATION` to a hand-placed `CADENCE_FLUSH()`: a flush is only correct
-once per iteration and never between scopes, and the scope enforces that.
+`stream` is optional and defaults to the default stream. Prefer `CADENCE_ITERATION` to a hand-placed `CADENCE_FLUSH()`. A flush is only correct once per iteration and never between scopes, and the scope enforces that.
+
+It also declares which span is the loop body. The report needs that to turn a sum of stage means into device time per iteration, and the deadline needs it whenever `budgetLabel` is empty. With no declared loop scope both fall back to inferring one, as the only host scope with no GPU work of its own, so adding a second CPU-side scope makes the run ambiguous and silently withdraws the per-iteration summary and the deadline verdict together. Declaring two loop scopes is ambiguous in the same way and is declined the same way.
 
 Macro labels must be a string literal or another const character array, and the compiler enforces it. A macro interns its label once per call site, so a label whose characters can change would file every scope under whichever value ran first. That is why the check rejects a mutable `char[32]` as well as a pointer: both can be rewritten after the handle is cached. Construct `cadence::ScopedHost` or `cadence::ScopedKernel` directly when the label is only known at runtime.
 
@@ -139,7 +139,7 @@ Macro labels must be a string literal or another const character array, and the 
 cadence::Config cfg;
 cfg.warmupIterations = 10;      // discard context creation, JIT, cuBLAS autotuning
 cfg.budgetMs = 0.080;           // deadline for one stage; 0 disables the check
-cfg.budgetLabel = "";           // which stage; empty picks the loop span
+cfg.budgetLabel = "";           // which stage; empty picks the declared iteration scope
 cfg.numWorstIterations = 3;     // slowest iterations kept whole; 0 turns it off
 cfg.tracePath = "worst.json";   // Perfetto-openable timeline of those iterations
 cfg.sampleEvery = 1;            // measure one iteration in N

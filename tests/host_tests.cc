@@ -513,13 +513,15 @@ namespace {
 
         const std::string text = RenderSummary(rows);
         CHECK(text.find("200us across 2 labels, one mean each") != std::string::npos);
-        CHECK(text.find("per iteration") == std::string::npos);
+        // "per iteration across" is the rate phrasing. Matching bare "per iteration" would also match the hint below, which claims nothing about this run.
+        CHECK(text.find("per iteration across") == std::string::npos);
         CHECK(text.find("is GPU work") == std::string::npos);
+        CHECK(text.find("wrap the loop body in CADENCE_ITERATION") != std::string::npos);
 
         // Two host-only labels are equally ambiguous: either could be the loop body, so neither is assumed to be.
         rows.push_back(MakeRow("outer", cadence::ScopeKind::Host, 0, std::vector<double>(10, 5.0)));
         rows.push_back(MakeRow("inner", cadence::ScopeKind::Host, 0, std::vector<double>(10, 1.0)));
-        CHECK(RenderSummary(rows).find("per iteration") == std::string::npos);
+        CHECK(RenderSummary(rows).find("per iteration across") == std::string::npos);
     }
 
     // Fold and cap graph workloads so the breakdown remains readable.
@@ -1055,7 +1057,7 @@ namespace {
         cadence::detail::ThreadState& state = cadence::detail::TlsState();
         {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.pendingHost.push_back(cadence::detail::HostRecord{cadence::detail::INVALID_LABEL_ID, 0, 1000});
+            state.pendingHost.push_back(cadence::detail::HostRecord{cadence::detail::INVALID_LABEL_ID, false, 0, 1000});
         }
         cadence::detail::Registry::Instance().RecordHost("survivor", 1.0);
         cadence::Flush();
@@ -1204,6 +1206,134 @@ namespace {
         void (*run)();
     };
 
+
+    // The reason CADENCE_ITERATION exists. Inferring the loop scope means "the one
+    // host label with no device row", so a second CPU-side stage -- a publish step, a
+    // postprocess -- makes the run ambiguous and silently turns the deadline verdict
+    // off. A declared iteration scope keeps it on.
+    void TestDeclaredIterationScopeSurvivesASecondHostScope() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.budgetMs = 0.5;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        for (int i = 0; i < 6; ++i) {
+            CADENCE_ITERATION("loop");
+            // A pure host stage, which is what makes the inference ambiguous.
+            registry.RecordHost("publish", 0.1);
+        }
+
+        bool found = false;
+        const cadence::Stats loop = Find("loop", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(loop.isIteration);
+        // The budget landed on the declared loop scope, not on the stage and not nowhere.
+        CHECK(loop.budgetMs == 0.5);
+
+        const cadence::Stats publish = Find("publish", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(!publish.isIteration);
+        CHECK(publish.budgetMs == 0.0);
+    }
+
+    // Same shape, through the report: the summary needs an iteration count to turn a
+    // sum of means into device time per pass, and it must find one here.
+    void TestSummaryUsesTheDeclaredIterationRow() {
+        std::vector<cadence::Stats> rows;
+        cadence::Stats loop = MakeRow("loop", cadence::ScopeKind::Host, 0, std::vector<double>(10, 2.0));
+        loop.isIteration = true;
+        rows.push_back(loop);
+        // Ambiguous under the old inference: two host-only labels, neither with a device row.
+        rows.push_back(MakeRow("publish", cadence::ScopeKind::Host, 0, std::vector<double>(10, 0.5)));
+        rows.push_back(MakeRow("once", cadence::ScopeKind::Device, 0, std::vector<double>(10, 0.1)));
+        rows.push_back(MakeRow("often", cadence::ScopeKind::Device, 0, std::vector<double>(100, 0.1)));
+
+        // 0.100ms + 10 x 0.100ms = 1.10ms of GPU work against the declared 2.00ms pass.
+        const std::string text = RenderSummary(rows);
+        CHECK(text.find("1.10ms per iteration across 2 labels") != std::string::npos);
+        CHECK(text.find("55.0% is GPU work") != std::string::npos);
+        // The denominator came from "loop"; "publish" must not have been picked instead.
+        CHECK(text.find("loop  ") != std::string::npos);
+    }
+
+    // Two loop scopes are as ambiguous as none. Guessing after the caller has already
+    // said which scopes are loops would be worse than declining, so the conclusion is
+    // withheld rather than attached to whichever came first.
+    void TestTwoDeclaredIterationScopesAreAmbiguous() {
+        std::vector<cadence::Stats> rows;
+        cadence::Stats outer = MakeRow("outer", cadence::ScopeKind::Host, 0, std::vector<double>(10, 5.0));
+        outer.isIteration = true;
+        cadence::Stats inner = MakeRow("inner", cadence::ScopeKind::Host, 0, std::vector<double>(10, 1.0));
+        inner.isIteration = true;
+        rows.push_back(outer);
+        rows.push_back(inner);
+        rows.push_back(MakeRow("work", cadence::ScopeKind::Device, 0, std::vector<double>(10, 0.1)));
+
+        const std::string text = RenderSummary(rows);
+        CHECK(text.find("per iteration across") == std::string::npos);
+        CHECK(text.find("is GPU work") == std::string::npos);
+    }
+
+    // The disabled flush walked every registered thread to find nothing, once per
+    // iteration. Gating it leaves records buffered before a mid-run disable for the
+    // next explicit Flush(), which is where they belong.
+    void TestDisabledIterationScopeDoesNotFlush() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        cadence::detail::Registry& registry = cadence::detail::Registry::Instance();
+        // Buffer a record while recording is still on, so there is something a flush
+        // would resolve and its absence is observable.
+        registry.RecordHost("pending", 1.0);
+
+        config.enabled = false;
+        cadence::Configure(config);
+        { CADENCE_ITERATION("loop"); }
+
+        bool found = false;
+        Find("pending", cadence::ScopeKind::Host, &found);
+        CHECK(!found);
+
+        // Still buffered rather than lost: re-enabling and flushing resolves it.
+        config.enabled = true;
+        cadence::Configure(config);
+        cadence::Flush();
+        const cadence::Stats pending = Find("pending", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(pending.count == 1);
+    }
+
+    // The registry side of the same rule. Two loops, each declaring its own
+    // iteration scope, leave the automatic budget target ambiguous; the deadline
+    // must attach to neither rather than to whichever was interned first.
+    void TestTwoDeclaredIterationScopesLeaveTheBudgetUnassigned() {
+        cadence::Config config;
+        config.warmupIterations = 0;
+        config.reportStream = nullptr;
+        config.budgetMs = 0.5;
+        cadence::Configure(config);
+        cadence::Reset();
+
+        for (int i = 0; i < 4; ++i) { CADENCE_ITERATION("loop-a"); }
+        for (int i = 0; i < 4; ++i) { CADENCE_ITERATION("loop-b"); }
+
+        bool found = false;
+        const cadence::Stats a = Find("loop-a", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(a.isIteration);
+        CHECK(a.budgetMs == 0.0);
+        const cadence::Stats b = Find("loop-b", cadence::ScopeKind::Host, &found);
+        CHECK(found);
+        CHECK(b.isIteration);
+        CHECK(b.budgetMs == 0.0);
+    }
+
 }  // namespace
 
 int main() {
@@ -1249,6 +1379,11 @@ int main() {
         {"iteration scope flushes when its label is refused", TestIterationScopeFlushesEvenWhenItsLabelIsRefused},
         {"flush races scope destruction and thread exit", TestFlushRacesScopeDestructionAndThreadExit},
         {"configure and reset during recording", TestConfigureAndResetDuringRecording},
+        {"declared iteration scope survives a second host scope", TestDeclaredIterationScopeSurvivesASecondHostScope},
+        {"summary uses the declared iteration row", TestSummaryUsesTheDeclaredIterationRow},
+        {"two declared iteration scopes are ambiguous", TestTwoDeclaredIterationScopesAreAmbiguous},
+        {"two declared iteration scopes leave the budget unassigned", TestTwoDeclaredIterationScopesLeaveTheBudgetUnassigned},
+        {"disabled iteration scope does not flush", TestDisabledIterationScopeDoesNotFlush},
     };
 
     for (const TestCase& test : tests) {

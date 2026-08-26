@@ -40,6 +40,9 @@ namespace cadence {
         // Counts in equal-width bins spanning min to max.
         std::array<std::uint32_t, NUM_HISTOGRAM_BINS> histogram{};
 
+        // True when a ScopedIteration produced this row, meaning it spans the loop body rather than a stage inside it. Always false on a device row.
+        bool isIteration = false;
+
         // The deadline this row is held to, and how often it was missed. Zero means no budget applies here, which is the case for every row but the one the budget names.
         double budgetMs = 0.0;
         std::size_t overBudget = 0;

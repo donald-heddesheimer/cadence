@@ -156,9 +156,10 @@ times per token. Weighting each mean by its occurrence rate gives 5.4 ms of
 device work per iteration instead of 205 µs, reversing the classification.
 
 *Fixed:* each mean is now weighted by `count / iterations`. The denominator is the
-observation count of the single pure-host label, which is the loop body and ran
-once per pass by construction. Without one there is no denominator, so the sum of
-the means is now labeled as exactly that and the conclusion is withheld.
+observation count of the loop body, which ran once per pass by construction.
+`CADENCE_ITERATION` declares which span that is; failing that, the report infers it
+as the single pure-host label. Where neither resolves, there is no denominator, so
+the sum of the means is labeled as exactly that and the conclusion is withheld.
 
 **2. The worst-iteration breakdown was unbounded.** With approximately 250 spans
 per iteration, `WriteWorstIterations` produced lines several thousand characters

@@ -55,7 +55,7 @@ namespace {
             numElements_ = static_cast<int>(declare_parameter<int>("num_elements", 1 << 20));
             numTaps_ = static_cast<int>(declare_parameter<int>("num_taps", 384));
 
-            // Apply the timer period to the automatically selected callback scope.
+            // The timer period is the deadline. An empty budgetLabel holds the declared iteration scope below to it.
             cadence::Config config;
             config.budgetMs = periodMs_;
             // Exclude context creation and module loading from steady-state results.
@@ -96,8 +96,8 @@ namespace {
         void OnTimer() {
             const auto began = std::chrono::steady_clock::now();
             {
-                // Measure the complete callback for deadline evaluation.
-                CADENCE_SCOPE("callback");
+                // The loop body, declared as such. A stage scope would leave the report inferring which span is the iteration, and that inference stops working the moment a second host-side scope is added to this callback.
+                CADENCE_ITERATION("callback");
 
                 const int numBlocks = NumBlocksFor(numElements_);
                 {
@@ -113,9 +113,8 @@ namespace {
                     Threshold<<<numBlocks, NUM_THREADS_PER_BLOCK, 0, stream_>>>(scores_, output_, numElements_, 0.5f);
                 }
 
-                // Resolve records at the callback's existing synchronization boundary.
+                // The scope flushes when it closes, so the events have to be complete before that. This is the callback's existing synchronization boundary, not one added for cadence.
                 cudaStreamSynchronize(stream_);
-                CADENCE_FLUSH();
             }
 
             const double elapsedMs =
