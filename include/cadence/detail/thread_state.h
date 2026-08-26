@@ -18,9 +18,17 @@ namespace cadence {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // What a host span is measuring. The loop body and a stage inside it are both steady_clock spans, so the measurement cannot tell them apart and the scope has to say which it is.
+    enum class SpanRole {
+        Stage,      // A span inside the loop body.
+        Iteration,  // The loop body itself, which is the denominator the summary and the automatic deadline target need.
+    };
+
     // Convert raw clock durations to milliseconds during flush.
     struct HostRecord {
         LabelId label;
+        // Carried per record rather than looked up per scope: the registry would have to be locked to mark a label, and this sits in the padding after the label, so it costs nothing.
+        bool iteration;
         std::int64_t startNs;  // steady_clock since its epoch. Carried so a span can be placed on a timeline, not just measured.
         std::int64_t elapsedNs;
     };

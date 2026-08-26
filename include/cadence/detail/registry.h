@@ -40,6 +40,7 @@ namespace cadence {
         std::uint64_t seen = 0;       // Observations kept for statistics, warmup included.
         std::uint64_t discarded = 0;  // Observations dropped as warmup.
         bool hasDevice = false;       // Set as soon as a device record arrives, warmup included, so a label does not read as host-only while its first iterations are being discarded.
+        bool isIteration = false;     // Set by a ScopedIteration span, warmup included for the same reason as hasDevice.
     };
 
     // Create device slots on demand and keep them ordered for stable reports.
@@ -282,6 +283,7 @@ namespace cadence {
                     // A refused label would index samples_ at INVALID_LABEL_ID, which is past the end of a vector that is only ever as long as the label table. No scope appends such a record today; the guard is what keeps that true if one ever does.
                     if (record.label == INVALID_LABEL_ID) continue;
                     LabelSamples& samples = SamplesFor(record.label);
+                    if (record.iteration) samples.isIteration = true;
                     if (KeepSample(samples, warmup)) {
                         if (record.elapsedNs > 0) {
                             samples.host.Add(static_cast<double>(record.elapsedNs) * 1e-6, budgetMs, capacity);
@@ -345,7 +347,9 @@ namespace cadence {
                 if (!samples.host.Empty()) {
                     // A plain CADENCE_SCOPE, which named no stream and so belongs to no GPU; its row keeps device = -1.
                     const double budget = target.Matches(id, ScopeKind::Host) ? config.budgetMs : 0.0;
-                    results.push_back(ComputeStatsFromSet(name, ScopeKind::Host, samples.host, samples.discarded, budget));
+                    Stats host = ComputeStatsFromSet(name, ScopeKind::Host, samples.host, samples.discarded, budget);
+                    host.isIteration = samples.isIteration;
+                    results.push_back(std::move(host));
                 }
             }
             return results;
@@ -467,8 +471,8 @@ namespace cadence {
             }
         };
 
-        // Resolve an explicit budget label first. Otherwise select the sole
-        // host-only loop scope and reject ambiguous candidates.
+        // Resolve an explicit budget label first, then a declared iteration scope,
+        // and only then fall back to inferring the sole host-only loop scope.
         BudgetTarget ResolveBudgetTarget(const Config& config, const std::vector<std::string>& names) const {
             BudgetTarget target;
             if (config.budgetMs <= 0.0) return target;
@@ -487,6 +491,18 @@ namespace cadence {
                 return target;
             }
 
+            // CADENCE_ITERATION names the loop body outright, so it decides. Two of them is as ambiguous as none, and guessing after the caller has already said which scope is the loop would be worse than declining.
+            std::size_t declaredCount = 0;
+            BudgetTarget declared;
+            for (std::size_t id = 0; id < samples_.size(); ++id) {
+                const LabelSamples& samples = samples_[id];
+                if (!samples.isIteration || samples.host.Empty()) continue;
+                ++declaredCount;
+                declared = BudgetTarget{true, id, ScopeKind::Host};
+            }
+            if (declaredCount > 0) return declaredCount == 1 ? declared : target;
+
+            // Nothing declared: infer the loop scope, which is what a run built entirely from CADENCE_SCOPE relies on. A second host-only stage makes this ambiguous and turns the deadline verdict off, which is the reason CADENCE_ITERATION exists.
             std::size_t hostOnlyCount = 0;
             for (std::size_t id = 0; id < samples_.size(); ++id) {
                 const LabelSamples& samples = samples_[id];
@@ -683,7 +699,7 @@ namespace cadence {
         const std::int64_t endNs = NowNs();
         ThreadState& state = TlsState();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.pendingHost.push_back(HostRecord{handle.id, endNs - elapsedNs, elapsedNs});
+        state.pendingHost.push_back(HostRecord{handle.id, false, endNs - elapsedNs, elapsedNs});
     }
 
     // Select one observation in every sampleEvery for each label.

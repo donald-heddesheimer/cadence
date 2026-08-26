@@ -22,16 +22,18 @@ namespace cadence {
     // A host-side span measured with steady_clock. Usable in plain C++ translation units with no CUDA in sight.
     class ScopedHost {
        public:
-        explicit ScopedHost(const detail::LabelHandle& label)
+        // Pass SpanRole::Iteration when this span covers a whole loop body. CADENCE_ITERATION and ScopedIteration do it for you; it is exposed here for a loop whose label is only known at runtime.
+        explicit ScopedHost(const detail::LabelHandle& label, detail::SpanRole role = detail::SpanRole::Stage)
             : labelId_(label.id),
+              iteration_(role == detail::SpanRole::Iteration),
               active_(!detail::LabelDropped(label) && detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSample(label)),
               nvtx_(label.name, active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
             if (CADENCE_LIKELY(active_)) startNs_ = detail::NowNs();
         }
 
         // Interns on every construction, and takes a lock to do it. CADENCE_SCOPE resolves the label once per call site instead; prefer it.
-        explicit ScopedHost(const char* label)
-            : ScopedHost(detail::LabelTable::Instance().Intern(label)) {}
+        explicit ScopedHost(const char* label, detail::SpanRole role = detail::SpanRole::Stage)
+            : ScopedHost(detail::LabelTable::Instance().Intern(label), role) {}
 
         // Closes the span. The destructor calls it; a second call records nothing.
         void End() {
@@ -40,7 +42,7 @@ namespace cadence {
             const std::int64_t endNs = detail::NowNs();
             detail::ThreadState& state = detail::TlsState();
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.pendingHost.push_back(detail::HostRecord{labelId_, startNs_, endNs - startNs_});
+            state.pendingHost.push_back(detail::HostRecord{labelId_, iteration_, startNs_, endNs - startNs_});
         }
 
         ~ScopedHost() { End(); }
@@ -50,6 +52,7 @@ namespace cadence {
 
        private:
         detail::LabelId labelId_;
+        bool iteration_;
         bool active_;
         detail::NvtxRange nvtx_;
         std::int64_t startNs_ = 0;
@@ -58,13 +61,16 @@ namespace cadence {
     // One loop iteration: a host span over the body that flushes when it closes, so CADENCE_FLUSH() need not be placed by hand.
     class ScopedIteration {
        public:
-        explicit ScopedIteration(const detail::LabelHandle& label) : span_(label) {}
-        explicit ScopedIteration(const char* label) : span_(label) {}
+        explicit ScopedIteration(const detail::LabelHandle& label) : span_(label, detail::SpanRole::Iteration) {}
+        explicit ScopedIteration(const char* label) : span_(label, detail::SpanRole::Iteration) {}
 
         // The span closes before the flush, so the body lands in this iteration and is not charged for resolving it.
         ~ScopedIteration() {
             span_.End();
-            detail::Registry::Instance().Flush();
+            // While cadence is disabled no scope buffers anything, so the flush would walk every registered thread to find nothing. Records buffered before a mid-run disable are still resolved by the next Flush() or Report().
+            if (CADENCE_LIKELY(detail::hotConfig.enabled.load(std::memory_order_relaxed))) {
+                detail::Registry::Instance().Flush();
+            }
         }
 
         ScopedIteration(const ScopedIteration&) = delete;

@@ -284,23 +284,32 @@ namespace cadence {
         }
     }
 
-    // Summarize device time per iteration. A sole host-only label provides the
-    // iteration count; otherwise report only the sum of label means. Weight each
-    // device mean by observations per iteration to support repeated labels.
+    // Summarize device time per iteration. A declared iteration scope provides the
+    // iteration count, falling back to a sole host-only label; otherwise report only
+    // the sum of label means. Weight each device mean by observations per iteration
+    // to support repeated labels.
     inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
         // Resolve the iteration denominator before computing device rates.
         const Stats* span = nullptr;
-        std::size_t hostOnlyLabels = 0;
+        std::size_t candidates = 0;
         for (const Stats& row : stats) {
-            if (row.kind != ScopeKind::Host) continue;
-            const bool hasDeviceRow = std::any_of(stats.begin(), stats.end(), [&](const Stats& other) {
-                return other.kind == ScopeKind::Device && other.label == row.label;
-            });
-            if (hasDeviceRow) continue;
-            ++hostOnlyLabels;
+            if (row.kind != ScopeKind::Host || !row.isIteration) continue;
+            ++candidates;
             span = &row;
         }
-        const bool haveIterations = hostOnlyLabels == 1 && span != nullptr && span->count > 0;
+        // Only when no scope declared itself the loop body, so a run built entirely from CADENCE_SCOPE reads exactly as it did before.
+        if (candidates == 0) {
+            for (const Stats& row : stats) {
+                if (row.kind != ScopeKind::Host) continue;
+                const bool hasDeviceRow = std::any_of(stats.begin(), stats.end(), [&](const Stats& other) {
+                    return other.kind == ScopeKind::Device && other.label == row.label;
+                });
+                if (hasDeviceRow) continue;
+                ++candidates;
+                span = &row;
+            }
+        }
+        const bool haveIterations = candidates == 1 && span != nullptr && span->count > 0;
         const double iterations = haveIterations ? static_cast<double>(span->count) : 0.0;
 
         // Concurrent GPUs receive independent totals.
@@ -331,6 +340,12 @@ namespace cadence {
                 << (haveIterations ? "" : ", one mean each");
             if (totals.size() > 1 && total.device >= 0) out << " on device " << total.device;
             out << "\n";
+        }
+        // The sum of means is not device time per iteration, and the difference is large when a label repeats within one pass. Name the thing that would resolve it rather than leaving the reader to work out why the better line is missing.
+        if (!haveIterations) {
+            std::string hint = "";
+            PadTo(hint, 8);
+            out << "  " << hint << "  " << theme.key << "wrap the loop body in CADENCE_ITERATION for device time per iteration" << theme.reset << "\n";
         }
 
         // Derive host overhead only for one GPU with a known iteration span.
