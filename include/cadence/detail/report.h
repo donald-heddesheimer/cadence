@@ -35,8 +35,7 @@ namespace cadence {
 
     namespace detail {
 
-    // ANSI escapes are applied after width calculations because they occupy no
-    // terminal cells. A value type allows terminal and file outputs to differ.
+    // ANSI escapes are applied after width calculations because they occupy no terminal cells. A value type allows terminal and file outputs to differ.
     struct Theme {
         const char* title = "";
         const char* key = "";     // Provenance keys, headings, rules: present but not competing with the numbers.
@@ -114,8 +113,7 @@ namespace cadence {
 
     // Render one cell per histogram bin, scaled against the peak bin.
     inline std::string RenderHistogram(const std::array<std::uint32_t, NUM_HISTOGRAM_BINS>& histogram, bool unicode) {
-        static const char* const BLOCKS[8] = {"\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84",
-                                              "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"};
+        static const char* const BLOCKS[8] = {"\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"};
         static const char* const ASCII[8] = {".", ".", ":", ":", "|", "|", "#", "#"};
 
         std::uint32_t peak = 0;
@@ -284,9 +282,7 @@ namespace cadence {
         }
     }
 
-    // Summarize device time per iteration. A sole host-only label provides the
-    // iteration count; otherwise report only the sum of label means. Weight each
-    // device mean by observations per iteration to support repeated labels.
+    // Summarize device time per iteration. A sole host-only label provides the iteration count; otherwise report only the sum of label means. Weight each device mean by observations per iteration to support repeated labels.
     inline void WriteSummary(std::ostream& out, const std::vector<Stats>& stats, bool unicode, const Theme& theme) {
         // Resolve the iteration denominator before computing device rates.
         const Stats* span = nullptr;
@@ -354,8 +350,7 @@ namespace cadence {
         for (const Stats& row : stats) {
             if (row.budgetMs <= 0.0 || row.count == 0) continue;
             ++numHeld;
-            const bool worse = held == nullptr || row.overBudget > held->overBudget ||
-                               (row.overBudget == held->overBudget && row.maxMs > held->maxMs);
+            const bool worse = held == nullptr || row.overBudget > held->overBudget || (row.overBudget == held->overBudget && row.maxMs > held->maxMs);
             if (worse) held = &row;
         }
         if (held == nullptr) return;

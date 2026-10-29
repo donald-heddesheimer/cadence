@@ -67,8 +67,7 @@ namespace {
 
     void TestStatistics() {
         const std::vector<double> samples = {2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0};
-        const cadence::Stats stats =
-            cadence::detail::ComputeStats("x", cadence::ScopeKind::Host, samples, 0);
+        const cadence::Stats stats = cadence::detail::ComputeStats("x", cadence::ScopeKind::Host, samples, 0);
         CHECK(stats.count == 8);
         CHECK_NEAR(stats.meanMs, 5.0, 1e-9);
         CHECK_NEAR(stats.minMs, 2.0, 1e-9);
@@ -77,8 +76,7 @@ namespace {
         // Sample standard deviation (n-1), not the population form.
         CHECK_NEAR(stats.stddevMs, 2.13809, 1e-5);
 
-        const cadence::Stats single =
-            cadence::detail::ComputeStats("x", cadence::ScopeKind::Host, {3.0}, 0);
+        const cadence::Stats single = cadence::detail::ComputeStats("x", cadence::ScopeKind::Host, {3.0}, 0);
         CHECK(single.count == 1);
         CHECK_NEAR(single.stddevMs, 0.0, 1e-9);
         CHECK_NEAR(single.jitterMs, 0.0, 1e-9);
@@ -262,8 +260,7 @@ namespace {
         CHECK(out.str().find("monotonic clock did not advance") != std::string::npos);
     }
 
-    // Deadline counts and aggregate statistics remain exact after reservoir
-    // sampling begins.
+    // Deadline counts and aggregate statistics remain exact after reservoir sampling begins.
     void TestBoundedRetentionKeepsExactAggregates() {
         constexpr std::size_t CAP = 64;
         constexpr int NUM_SAMPLES = 5000;
@@ -398,8 +395,7 @@ namespace {
         CHECK(off.str().find("slowest iterations") == std::string::npos);
     }
 
-    // Perfetto reserves thread id 0 for the idle task. Assign distinct nonzero
-    // ids so host and device spans render on separate tracks.
+    // Perfetto reserves thread id 0 for the idle task. Assign distinct nonzero ids so host and device spans render on separate tracks.
     void TestTraceLanesAreDistinctThreads() {
         cadence::TraceIteration iteration;
         iteration.index = 0;
@@ -485,9 +481,7 @@ namespace {
         return out.str();
     }
 
-    // Summary totals must weight repeated labels by their observations per
-    // iteration. Otherwise a graph with many operations under one label is
-    // incorrectly classified as host-bound.
+    // Summary totals must weight repeated labels by their observations per iteration. Otherwise a graph with many operations under one label is incorrectly classified as host-bound.
     void TestSummaryWeightsLabelsByHowOftenTheyRun() {
         // 10 iterations of a 2.00ms loop body. One kernel runs once per pass at 100us; the other runs ten times per pass at 100us, so it is 1.00ms of the iteration and the naive sum would call it 100us.
         std::vector<cadence::Stats> rows;
@@ -885,16 +879,14 @@ namespace {
 
     // A label interned once must survive the table growing under it. The handle a call site caches points into the table, so a container that moved its elements would leave every earlier call site holding a dangling name.
     void TestInternedHandlesSurviveTableGrowth() {
-        const cadence::detail::LabelHandle first =
-            cadence::detail::LabelTable::Instance().Intern("survivor");
+        const cadence::detail::LabelHandle first = cadence::detail::LabelTable::Instance().Intern("survivor");
         const std::string firstName = first.name;
         for (int i = 0; i < 512; ++i) {
             cadence::detail::LabelTable::Instance().Intern(("filler-" + std::to_string(i)).c_str());
         }
         CHECK(std::string(first.name) == firstName);
         CHECK(std::string(first.name) == "survivor");
-        const cadence::detail::LabelHandle again =
-            cadence::detail::LabelTable::Instance().Intern("survivor");
+        const cadence::detail::LabelHandle again = cadence::detail::LabelTable::Instance().Intern("survivor");
         CHECK(again.id == first.id);
         CHECK(again.observations == first.observations);
     }

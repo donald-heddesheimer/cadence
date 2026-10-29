@@ -20,8 +20,7 @@ namespace {
 
     void CheckNear(double actual, double expected, double tolerance, const std::string& what) {
         const bool ok = actual >= expected * (1.0 - tolerance) && actual <= expected * (1.0 + tolerance);
-        std::printf("[%s] %s (got %.4f, expected %.4f +/- %.0f%%)\n", ok ? " ok " : "FAIL", what.c_str(),
-                    actual, expected, tolerance * 100.0);
+        std::printf("[%s] %s (got %.4f, expected %.4f +/- %.0f%%)\n", ok ? " ok " : "FAIL", what.c_str(), actual, expected, tolerance * 100.0);
         if (!ok) ++failures;
     }
 
@@ -52,8 +51,7 @@ namespace {
         return -1.0;
     }
 
-    std::size_t CountOf(const std::vector<cadence::Stats>& snapshot, const std::string& label,
-                        cadence::ScopeKind kind) {
+    std::size_t CountOf(const std::vector<cadence::Stats>& snapshot, const std::string& label, cadence::ScopeKind kind) {
         for (const cadence::Stats& row : snapshot) {
             if (row.label == label && row.kind == kind) return row.count;
         }
@@ -90,8 +88,7 @@ namespace {
         const double doubled = DeviceMs(snapshot, "paired-2x");
         Check(single > 0.0, "paired scope produced a device measurement");
         CheckNear(doubled / single, 2.0, 0.20, "paired scope scales with work");
-        Check(CountOf(snapshot, "paired-1x", cadence::ScopeKind::Device) == 28,
-              "paired scope discarded exactly the warmup iterations");
+        Check(CountOf(snapshot, "paired-1x", cadence::ScopeKind::Device) == 28, "paired scope discarded exactly the warmup iterations");
     }
 
     // The same shape through the chained scope. Every launch on the stream is inside a stage, so chaining has no gap to absorb and should agree with the paired numbers.
@@ -113,8 +110,7 @@ namespace {
         const double doubled = DeviceMs(snapshot, "stage-2x");
         Check(single > 0.0, "chained stage produced a device measurement");
         CheckNear(doubled / single, 2.0, 0.20, "chained stage scales with work");
-        Check(CountOf(snapshot, "stage-1x", cadence::ScopeKind::Device) == 28,
-              "chained stage discarded exactly the warmup iterations");
+        Check(CountOf(snapshot, "stage-1x", cadence::ScopeKind::Device) == 28, "chained stage discarded exactly the warmup iterations");
     }
 
     // Chained stages charge uninstrumented gaps to the following stage.
@@ -184,16 +180,13 @@ namespace {
         const std::size_t afterWarmup = cadence::detail::Registry::Instance().LiveEventCount();
         run(2000);
         const std::size_t afterLong = cadence::detail::Registry::Instance().LiveEventCount();
-        Check(afterLong == afterWarmup, "live event count is unchanged after 10x the iterations (" +
-                                            std::to_string(afterWarmup) + " events)");
+        Check(afterLong == afterWarmup, "live event count is unchanged after 10x the iterations (" + std::to_string(afterWarmup) + " events)");
         Check(cadence::FailedRecordCount() == 0, "no records dropped across 2200 iterations");
         const auto snapshot = cadence::Snapshot();
-        Check(CountOf(snapshot, "pool-a", cadence::ScopeKind::Device) == 2200,
-              "every chained iteration produced exactly one sample");
+        Check(CountOf(snapshot, "pool-a", cadence::ScopeKind::Device) == 2200, "every chained iteration produced exactly one sample");
     }
 
-    // Interleaved streams must keep independent stage chains. Compare each
-    // chained result with a paired scope under the same contention.
+    // Interleaved streams must keep independent stage chains. Compare each chained result with a paired scope under the same contention.
     void TestChainsArePerStream(float* sink, cudaStream_t first, cudaStream_t second) {
         const auto runLoop = [&](bool chained) {
             for (int i = 0; i < 30; ++i) {
@@ -230,11 +223,9 @@ namespace {
         const double pairedSecond = DeviceMs(snapshot, "paired-b");
         const double chainedFirst = DeviceMs(snapshot, "chained-a");
         const double chainedSecond = DeviceMs(snapshot, "chained-b");
-        Check(pairedFirst > 0.0 && pairedSecond > 0.0 && chainedFirst > 0.0 && chainedSecond > 0.0,
-              "both streams produced measurements both ways");
+        Check(pairedFirst > 0.0 && pairedSecond > 0.0 && chainedFirst > 0.0 && chainedSecond > 0.0, "both streams produced measurements both ways");
         CheckNear(chainedFirst, pairedFirst, 0.25, "chained stage on stream 1 matches its paired scope");
-        CheckNear(chainedSecond, pairedSecond, 0.25,
-                  "chained stage on stream 2 matches its paired scope");
+        CheckNear(chainedSecond, pairedSecond, 0.25, "chained stage on stream 2 matches its paired scope");
     }
 
     void TestSamplingKeepsEveryNth(float* sink, cudaStream_t stream) {
@@ -247,8 +238,7 @@ namespace {
             cadence::Flush();
         }
         const auto snapshot = cadence::Snapshot();
-        Check(CountOf(snapshot, "sampled", cadence::ScopeKind::Device) == 25,
-              "sampleEvery=4 measured 25 of 100 iterations");
+        Check(CountOf(snapshot, "sampled", cadence::ScopeKind::Device) == 25, "sampleEvery=4 measured 25 of 100 iterations");
         ResetLibrary(0, 1);
     }
 
@@ -275,13 +265,11 @@ namespace {
         ResetLibrary(0, 1);
     }
 
-    // Events recorded during capture become part of the graph and cannot be
-    // queried safely. Scopes must skip captured streams.
+    // Events recorded during capture become part of the graph and cannot be queried safely. Scopes must skip captured streams.
     void TestStreamCaptureIsRefusedRatherThanCorrupted(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 1);
         cudaGraph_t graph = nullptr;
-        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess,
-              "capture began");
+        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess, "capture began");
         {
             CADENCE_KERNEL("captured-kernel", stream);
             Spin<<<8, 64, 0, stream>>>(sink, 64);
@@ -296,20 +284,16 @@ namespace {
 
         cadence::Flush();
         const auto snapshot = cadence::Snapshot();
-        Check(CountOf(snapshot, "captured-kernel", cadence::ScopeKind::Device) == 0 &&
-                  CountOf(snapshot, "captured-stage", cadence::ScopeKind::Device) == 0,
-              "no measurements were invented for the captured region");
+        Check(CountOf(snapshot, "captured-kernel", cadence::ScopeKind::Device) == 0 && CountOf(snapshot, "captured-stage", cadence::ScopeKind::Device) == 0, "no measurements were invented for the captured region");
         Check(cadence::CapturedScopeCount() >= 2, "the skipped scopes were counted and reported");
-        Check(cadence::FailedRecordCount() == 0,
-              "standing down left no broken records behind");
+        Check(cadence::FailedRecordCount() == 0, "standing down left no broken records behind");
 
         if (graph) cudaGraphDestroy(graph);
         cudaGetLastError();
         ResetLibrary(0, 1);
     }
 
-    // Flushing a scope recorded during capture invalidates the graph. Verify that
-    // instrumentation skips the scope and preserves capture completion.
+    // Flushing a scope recorded during capture invalidates the graph. Verify that instrumentation skips the scope and preserves capture completion.
     void TestFlushInsideCaptureLeavesTheGraphIntact(float* sink, cudaStream_t stream) {
         ResetLibrary(0, 1);
         cudaGraph_t graph = nullptr;
@@ -480,9 +464,7 @@ namespace {
         for (std::thread& worker : workers) worker.join();
         cadence::Flush();
         const auto snapshot = cadence::Snapshot();
-        Check(CountOf(snapshot, "threaded", cadence::ScopeKind::Device) ==
-                  NUM_THREADS_USED * NUM_ITERATIONS,
-              "every thread's records survived the flush");
+        Check(CountOf(snapshot, "threaded", cadence::ScopeKind::Device) == NUM_THREADS_USED * NUM_ITERATIONS, "every thread's records survived the flush");
         Check(cadence::FailedRecordCount() == 0, "no records dropped under concurrency");
     }
 

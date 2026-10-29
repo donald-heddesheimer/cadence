@@ -1,5 +1,4 @@
-// Recycled, timing-enabled CUDA events. Threads refill local caches in batches,
-// and each device owns a separate pool because CUDA events are device-local.
+// Recycled, timing-enabled CUDA events. Threads refill local caches in batches, and each device owns a separate pool because CUDA events are device-local.
 #pragma once
 
 #include <cstddef>

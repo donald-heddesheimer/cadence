@@ -84,9 +84,7 @@ def main(src, dst, title):
         y = PAD_TOP + i * LINE_H
         length = len(text) * ADVANCE
         spans = []
-        # Runs are emitted back to back with no explicit x, so columns stay aligned
-        # in the selected monospace font; textLength then pins
-        # the whole line to the width the layout above was computed against.
+        # Runs are emitted back to back with no explicit x, so columns stay aligned in the selected monospace font; textLength then pins the whole line to the width the layout above was computed against.
         line_runs = runs(line)
         for index, (chunk, fill, weight) in enumerate(line_runs):
             if index == len(line_runs) - 1:

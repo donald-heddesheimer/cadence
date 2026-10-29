@@ -1,5 +1,4 @@
-// Label interning. Scope macros cache a compact handle at each call site;
-// directly constructed scopes resolve their labels on every execution.
+// Label interning. Scope macros cache a compact handle at each call site; directly constructed scopes resolve their labels on every execution.
 #pragma once
 
 #include <atomic>
@@ -20,7 +19,7 @@ namespace cadence {
 
     inline constexpr LabelId INVALID_LABEL_ID = 0xFFFFFFFFu;
 
-    // What a call site caches. 
+    // What a call site caches.
     struct LabelHandle {
         LabelId id = INVALID_LABEL_ID;
         std::atomic<std::uint64_t>* observations = nullptr;
@@ -96,11 +95,7 @@ namespace cadence {
     template <typename T>
     constexpr const char* RequireStableLabel(T&& label) {
         using Label = std::remove_reference_t<T>;
-        static_assert(std::is_array<Label>::value && std::is_const<std::remove_extent_t<Label>>::value,
-                      "cadence: a macro label must be a string literal, or another const character array. The macro "
-                      "interns it once per call site, so a label whose contents can change would file every scope "
-                      "under its first value. Use cadence::ScopedHost or cadence::ScopedKernel directly for a label "
-                      "computed at runtime.");
+        static_assert(std::is_array<Label>::value && std::is_const<std::remove_extent_t<Label>>::value, "cadence: a macro label must be a string literal, or another const character array. The macro interns it once per call site, so a label whose contents can change would file every scope under its first value. Use cadence::ScopedHost or cadence::ScopedKernel directly for a label computed at runtime.");
         return label;
     }
 
@@ -113,8 +108,6 @@ namespace cadence {
 // Resolve a label once per call site using thread-safe static initialization.
 #define CADENCE_DETAIL_LABEL(label)                             \
     ([]() -> const ::cadence::detail::LabelHandle& {            \
-        static const ::cadence::detail::LabelHandle handle =    \
-            ::cadence::detail::LabelTable::Instance().Intern(   \
-                ::cadence::detail::RequireStableLabel(label));  \
+        static const ::cadence::detail::LabelHandle handle = ::cadence::detail::LabelTable::Instance().Intern(::cadence::detail::RequireStableLabel(label)); \
         return handle;                                          \
     }())

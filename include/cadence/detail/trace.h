@@ -47,8 +47,7 @@ namespace cadence {
         std::vector<IterationSpan> spans;
     };
 
-    // Rank by the longer of the enclosing host span and total device work. This
-    // handles asynchronous loops whose host scope ends before GPU completion.
+    // Rank by the longer of the enclosing host span and total device work. This handles asynchronous loops whose host scope ends before GPU completion.
     inline double IterationSpanMs(const std::vector<IterationSpan>& spans) {
         double longestHost = 0.0;
         double deviceTotal = 0.0;
@@ -108,8 +107,7 @@ namespace cadence {
             first = false;
         };
 
-        // Perfetto reserves tid 0 for the idle task. Shift host and stream lanes
-        // by one so each renders on its own track.
+        // Perfetto reserves tid 0 for the idle task. Shift host and stream lanes by one so each renders on its own track.
         constexpr int TID_OFFSET = 1;
 
         // Metadata naming the lanes. Without these a viewer labels every row by a bare numeric id.

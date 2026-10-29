@@ -32,8 +32,7 @@ namespace cadence {
     inline void Configure(const Config& config) { detail::Registry::Instance().Configure(config); }
     inline Config GetConfig() { return detail::Registry::Instance().GetConfig(); }
 
-    // Resolve pending records and update statistics. This synchronizes, so call
-    // it at a loop or frame boundary.
+    // Resolve pending records and update statistics. This synchronizes, so call it at a loop or frame boundary.
     inline void Flush() { detail::Registry::Instance().Flush(); }
 
     // Per-label statistics for everything flushed so far.
@@ -62,15 +61,13 @@ namespace cadence {
 #endif
     }
 
-    // Retained slow iterations, ordered slowest first. An iteration contains all
-    // records between two flushes.
+    // Retained slow iterations, ordered slowest first. An iteration contains all records between two flushes.
     inline std::vector<TraceIteration> WorstIterations() { return detail::Registry::Instance().WorstIterations(); }
 
     // Render the report to an already-open stream. Does not flush first.
     inline void WriteReport(std::ostream& out) { detail::Registry::Instance().WriteTo(out); }
 
-    // Write retained iterations as Chrome Trace Event JSON. Absolute GPU
-    // placement is available when Config::tracePath was set before recording.
+    // Write retained iterations as Chrome Trace Event JSON. Absolute GPU placement is available when Config::tracePath was set before recording.
     inline void WriteTrace(std::ostream& out) { detail::Registry::Instance().WriteTraceTo(out); }
 
     // Returns false if the file could not be opened.
@@ -89,8 +86,7 @@ namespace cadence {
         return out.good();
     }
 
-    // Flush and write configured report and trace outputs. Calling Report()
-    // disables the exit-time fallback.
+    // Flush and write configured report and trace outputs. Calling Report() disables the exit-time fallback.
     inline bool Report() {
         Flush();
         const Config config = GetConfig();
@@ -110,15 +106,12 @@ namespace cadence {
 // CADENCE_KERNEL("label", stream)    -- times work on `stream`
 #define CADENCE_KERNEL(...) CADENCE_DETAIL_KERNEL_IMPL(__VA_ARGS__, 0, 0)
 #define CADENCE_DETAIL_KERNEL_IMPL(label, stream, ...)                                              \
-    ::cadence::ScopedKernel CADENCE_DETAIL_UNIQUE(cadenceKernelScope_)(CADENCE_DETAIL_LABEL(label), \
-                                                                       stream)
+    ::cadence::ScopedKernel CADENCE_DETAIL_UNIQUE(cadenceKernelScope_)(CADENCE_DETAIL_LABEL(label), stream)
 
-// CADENCE_STAGE records one event per stage. Uninstrumented gaps are charged to
-// the following stage; see ScopedStage for the full contract.
+// CADENCE_STAGE records one event per stage. Uninstrumented gaps are charged to the following stage; see ScopedStage for the full contract.
 #define CADENCE_STAGE(...) CADENCE_DETAIL_STAGE_IMPL(__VA_ARGS__, 0, 0)
 #define CADENCE_DETAIL_STAGE_IMPL(label, stream, ...)                                             \
-    ::cadence::ScopedStage CADENCE_DETAIL_UNIQUE(cadenceStageScope_)(CADENCE_DETAIL_LABEL(label), \
-                                                                     stream)
+    ::cadence::ScopedStage CADENCE_DETAIL_UNIQUE(cadenceStageScope_)(CADENCE_DETAIL_LABEL(label), stream)
 #else
 #define CADENCE_KERNEL(...) ((void)0)
 #define CADENCE_STAGE(...) ((void)0)
@@ -128,11 +121,9 @@ namespace cadence {
 #define CADENCE_SCOPE(label) \
     ::cadence::ScopedHost CADENCE_DETAIL_UNIQUE(cadenceHostScope_)(CADENCE_DETAIL_LABEL(label))
 
-// Loop body span that flushes when it closes. Safer than a hand-placed
-// CADENCE_FLUSH(), which is only correct once per iteration.
+// Loop body span that flushes when it closes. Safer than a hand-placed CADENCE_FLUSH(), which is only correct once per iteration.
 #define CADENCE_ITERATION(label)                                         \
-    ::cadence::ScopedIteration CADENCE_DETAIL_UNIQUE(cadenceIteration_)( \
-        CADENCE_DETAIL_LABEL(label))
+    ::cadence::ScopedIteration CADENCE_DETAIL_UNIQUE(cadenceIteration_)(CADENCE_DETAIL_LABEL(label))
 #define CADENCE_FLUSH() ::cadence::Flush()
 #define CADENCE_REPORT() ::cadence::Report()
 #define CADENCE_CONFIGURE(config) ::cadence::Configure(config)

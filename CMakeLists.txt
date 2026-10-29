@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cadence VERSION 0.2.0 DESCRIPTION "In-process CUDA loop timing" LANGUAGES CXX)
 
-# Consumers need only the headers, C++17, and the thread library. CUDA is not
-# enabled for the interface target.
+# Consumers need only the headers, C++17, and the thread library. CUDA is not enabled for the interface target.
 add_library(cadence INTERFACE)
 add_library(cadence::cadence ALIAS cadence)
 
@@ -25,8 +24,7 @@ option(CADENCE_BUILD_TESTS "Build cadence tests" ${CADENCE_IS_TOP_LEVEL})
 option(CADENCE_BUILD_EXAMPLES "Build cadence examples" ${CADENCE_IS_TOP_LEVEL})
 option(CADENCE_BUILD_BENCHMARKS "Build cadence benchmarks" ${CADENCE_IS_TOP_LEVEL})
 
-# Device tests and examples require nvcc. Select it with
-# -DCMAKE_CUDA_COMPILER=... or the CUDACXX environment variable.
+# Device tests and examples require nvcc. Select it with -DCMAKE_CUDA_COMPILER=... or the CUDACXX environment variable.
 if(CADENCE_BUILD_TESTS OR CADENCE_BUILD_EXAMPLES OR CADENCE_BUILD_BENCHMARKS)
   include(CheckLanguage)
   check_language(CUDA)
@@ -74,8 +72,7 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion
   ARCH_INDEPENDENT)
 
-# The installed package resolves the Threads dependency used by the exported
-# interface target.
+# The installed package resolves the Threads dependency used by the exported interface target.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cadenceConfig.cmake"
 "include(CMakeFindDependencyMacro)\n\
 find_dependency(Threads)\n\

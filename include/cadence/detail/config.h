@@ -54,8 +54,7 @@ namespace cadence {
         // Deadline label. Empty selects an unambiguous host-only loop scope.
         std::string budgetLabel;
 
-        // Reservoir size per row. Zero retains all observations. Aggregates and
-        // deadline counts remain exact when the reservoir is full.
+        // Reservoir size per row. Zero retains all observations. Aggregates and deadline counts remain exact when the reservoir is full.
         std::size_t maxSamplesPerLabel = NUM_SAMPLES_RETAINED;
 
         // Distinct labels the process may intern. Zero removes the ceiling.
@@ -66,8 +65,7 @@ namespace cadence {
         // Number of slow iterations retained with their stage breakdowns.
         std::size_t numWorstIterations = 3;
 
-        // Optional Chrome Trace Event JSON path for retained iterations. Enabling
-        // tracing adds an elapsed-time query per device record during flush.
+        // Optional Chrome Trace Event JSON path for retained iterations. Enabling tracing adds an elapsed-time query per device record during flush.
         std::string tracePath;
     };
 

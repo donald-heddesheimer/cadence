@@ -1,5 +1,4 @@
-// Per-thread recording state. Shared ownership keeps a block alive during a
-// concurrent flush; retired blocks are removed after they drain.
+// Per-thread recording state. Shared ownership keeps a block alive during a concurrent flush; retired blocks are removed after they drain.
 #pragma once
 
 #include <chrono>

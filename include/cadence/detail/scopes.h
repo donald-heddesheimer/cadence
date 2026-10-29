@@ -82,11 +82,8 @@ namespace cadence {
         explicit ScopedKernel(const detail::LabelHandle& label, cudaStream_t stream = 0)
             : labelId_(label.id),
               stream_(stream),
-              active_(!detail::LabelDropped(label) &&
-                      detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
-                      detail::ShouldSample(label)),
-              nvtx_(label.name,
-                    active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
+              active_(!detail::LabelDropped(label) && detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSample(label)),
+              nvtx_(label.name, active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
             if (!active_) return;
             // Nothing may be recorded onto a stream that is being captured into a graph, so the scope stands down and says so in the report rather than corrupting the capture.
             if (CADENCE_UNLIKELY(detail::StreamIsCapturing(stream_))) {
@@ -98,6 +95,7 @@ namespace cadence {
             detail::ThreadState& state = detail::TlsState();
             start_ = detail::TakeEvent(state, device_);
             stop_ = detail::TakeEvent(state, device_);
+
             if (CADENCE_UNLIKELY(!start_ || !stop_)) {
                 // Out of events: stay quiet rather than taking the application down, but hand back whatever was taken so the count stays honest.
                 active_ = false;
@@ -113,8 +111,8 @@ namespace cadence {
 
         ~ScopedKernel() {
             if (!active_) return;
-            // Capture may begin inside the scope. Return both events without
-            // recording the stop event into the graph.
+
+            // Capture may begin inside the scope. Return both events without recording the stop event into the graph.
             if (CADENCE_UNLIKELY(detail::StreamIsCapturing(stream_))) {
                 detail::ThreadState& state = detail::TlsState();
                 detail::GiveBackEvent(state, device_, start_);
@@ -153,11 +151,8 @@ namespace cadence {
         explicit ScopedStage(const detail::LabelHandle& label, cudaStream_t stream = 0)
             : labelId_(label.id),
               stream_(stream),
-              active_(!detail::LabelDropped(label) &&
-                      detail::hotConfig.enabled.load(std::memory_order_relaxed) &&
-                      detail::ShouldSampleChain(label, stream)),
-              nvtx_(label.name,
-                    active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
+              active_(!detail::LabelDropped(label) && detail::hotConfig.enabled.load(std::memory_order_relaxed) && detail::ShouldSampleChain(label, stream)),
+              nvtx_(label.name, active_ && detail::hotConfig.nvtxEnabled.load(std::memory_order_relaxed)) {
             if (!active_) return;
             if (CADENCE_UNLIKELY(detail::StreamIsCapturing(stream_))) {
                 active_ = false;

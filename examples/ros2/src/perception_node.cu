@@ -68,11 +68,9 @@ namespace {
             cudaStreamCreate(&stream_);
 
             publisher_ = create_publisher<std_msgs::msg::Float32>("~/latency_ms", 10);
-            timer_ = create_wall_timer(std::chrono::duration<double, std::milli>(periodMs_),
-                                       [this]() { OnTimer(); });
+            timer_ = create_wall_timer(std::chrono::duration<double, std::milli>(periodMs_), [this]() { OnTimer(); });
 
-            RCLCPP_INFO(get_logger(), "publishing every %.1f ms; %d elements, %d taps; deadline %.1f ms",
-                        periodMs_, numElements_, numTaps_, periodMs_);
+            RCLCPP_INFO(get_logger(), "publishing every %.1f ms; %d elements, %d taps; deadline %.1f ms", periodMs_, numElements_, numTaps_, periodMs_);
         }
 
         ~PerceptionNode() override {
@@ -85,8 +83,7 @@ namespace {
        private:
         void AllocateOrThrow() {
             const std::size_t bytes = static_cast<std::size_t>(numElements_) * sizeof(float);
-            if (cudaMalloc(&input_, bytes) != cudaSuccess || cudaMalloc(&scores_, bytes) != cudaSuccess ||
-                cudaMalloc(&output_, bytes) != cudaSuccess) {
+            if (cudaMalloc(&input_, bytes) != cudaSuccess || cudaMalloc(&scores_, bytes) != cudaSuccess || cudaMalloc(&output_, bytes) != cudaSuccess) {
                 throw std::runtime_error("could not allocate device buffers");
             }
             const std::vector<float> seed(static_cast<std::size_t>(numElements_), 1.0f);
@@ -118,8 +115,7 @@ namespace {
                 CADENCE_FLUSH();
             }
 
-            const double elapsedMs =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+            const double elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
             std_msgs::msg::Float32 message;
             message.data = static_cast<float>(elapsedMs);
             publisher_->publish(message);

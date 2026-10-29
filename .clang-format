@@ -11,8 +11,7 @@ UseTab: Never
 ColumnLimit: 0
 ReflowComments: false
 
-# Namespace indentation is maintained manually because nested `detail`
-# namespaces intentionally remain aligned with their opening declaration.
+# Namespace indentation is maintained manually because nested `detail` namespaces intentionally remain aligned with their opening declaration.
 NamespaceIndentation: All
 
 DerivePointerAlignment: false

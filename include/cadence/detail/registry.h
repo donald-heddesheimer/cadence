@@ -42,8 +42,7 @@ namespace cadence {
         bool hasDevice = false;       // Set as soon as a device record arrives, warmup included, so a label does not read as host-only while its first iterations are being discarded.
     };
 
-    // Create device slots on demand and keep them ordered for stable reports.
-    // This free function remains available to host-only tests.
+    // Create device slots on demand and keep them ordered for stable reports. This free function remains available to host-only tests.
     inline DeviceSamples& SlotFor(LabelSamples& samples, LabelId label, int device) {
         std::size_t index = 0;
         while (index < samples.devices.size() && samples.devices[index].device < device) ++index;
@@ -69,8 +68,7 @@ namespace cadence {
 
     // Ties the GPU clock to the host clock for one flush on one device.
     //
-    // Map a dedicated CUDA event to a host timestamp. Reusing an earlier stop
-    // event would shift spans by the unbounded delay before Flush().
+    // Map a dedicated CUDA event to a host timestamp. Reusing an earlier stop event would shift spans by the unbounded delay before Flush().
     struct TraceAnchor {
         cudaEvent_t event = nullptr;
         std::int64_t hostNs = 0;
@@ -81,8 +79,7 @@ namespace cadence {
     class Registry {
        public:
         static Registry& Instance() {
-            // Intentionally process-lifetime to avoid static destruction order
-            // conflicts with thread-local state and the CUDA runtime.
+            // Intentionally process-lifetime to avoid static destruction order conflicts with thread-local state and the CUDA runtime.
             static Registry* instance = new Registry();
             return *instance;
         }
@@ -130,7 +127,7 @@ namespace cadence {
         std::size_t CapturedScopeCount() const { return capturedScopes_.load(std::memory_order_relaxed); }
 #endif
 
-        // Appends a host observation without a scope object. Interns on every call, so it is for tests and for callers who already have a duration in hand. 
+        // Appends a host observation without a scope object. Interns on every call, so it is for tests and for callers who already have a duration in hand.
         void RecordHost(const char* label, double elapsedMs);
 
         std::shared_ptr<ThreadState> RegisterThread() {
@@ -140,7 +137,7 @@ namespace cadence {
             return state;
         }
 
-        // Consumes every pending record from every thread. 
+        // Consumes every pending record from every thread.
         void Flush() {
             // Bumping first means a thread that starts a stage after this point opens a fresh chain rather than extending one whose events are about to be recycled.
             flushGeneration_.fetch_add(1, std::memory_order_relaxed);
@@ -205,8 +202,7 @@ namespace cadence {
             const std::size_t capacity = hotConfig.maxSamplesPerLabel.load(std::memory_order_relaxed);
             const std::size_t numWorst = hotConfig.numWorstIterations.load(std::memory_order_relaxed);
 
-            // A flush defines one iteration. Reuse the span buffer to avoid
-            // steady-state allocations.
+            // A flush defines one iteration. Reuse the span buffer to avoid steady-state allocations.
             const std::uint64_t iterationIndex = flushGeneration_.load(std::memory_order_relaxed) - 1;
 
 #if CADENCE_HAS_CUDA
@@ -225,9 +221,7 @@ namespace cadence {
                         float elapsedMs = 0.0f;
                         // A refused label has no row to fold into. It is screened out here rather than skipped outright because its events still belong to the pool and the return below has to run either way, and it is kept separate from `valid` so it is not counted as an event failure, which it is not.
                         const bool usable = record.label != INVALID_LABEL_ID;
-                        const bool valid =
-                            usable && record.start && record.stop &&
-                            cudaEventElapsedTime(&elapsedMs, record.start, record.stop) == cudaSuccess;
+                        const bool valid = usable && record.start && record.stop && cudaEventElapsedTime(&elapsedMs, record.start, record.stop) == cudaSuccess;
                         if (valid) {
                             LabelSamples& samples = SamplesFor(record.label);
                             samples.hasDevice = true;
@@ -467,8 +461,7 @@ namespace cadence {
             }
         };
 
-        // Resolve an explicit budget label first. Otherwise select the sole
-        // host-only loop scope and reject ambiguous candidates.
+        // Resolve an explicit budget label first. Otherwise select the sole host-only loop scope and reject ambiguous candidates.
         BudgetTarget ResolveBudgetTarget(const Config& config, const std::vector<std::string>& names) const {
             BudgetTarget target;
             if (config.budgetMs <= 0.0) return target;
@@ -512,8 +505,7 @@ namespace cadence {
         }
 
 #if CADENCE_HAS_CUDA
-        // Record one anchor per active device and timestamp the midpoint around
-        // its synchronization. anchorMutex_ serializes concurrent flushes.
+        // Record one anchor per active device and timestamp the midpoint around its synchronization. anchorMutex_ serializes concurrent flushes.
         std::vector<TraceAnchor> RecordTraceAnchors(const std::vector<std::vector<DeviceRecord>>& batches) {
             std::lock_guard<std::mutex> lock(anchorMutex_);
             std::vector<cudaStream_t> streams;
@@ -696,13 +688,11 @@ namespace cadence {
     }
 
 #if CADENCE_HAS_CUDA
-    // Events recorded during capture become graph nodes and cannot be queried or
-    // recycled safely, so captured streams are never instrumented.
+    // Events recorded during capture become graph nodes and cannot be queried or recycled safely, so captured streams are never instrumented.
     CADENCE_ALWAYS_INLINE bool StreamIsCapturing(cudaStream_t stream) {
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         if (CADENCE_UNLIKELY(cudaStreamIsCapturing(stream, &status) != cudaSuccess)) {
-            // Global capture can surface as an error on the legacy default stream.
-            // Clear the probe error before returning.
+            // Global capture can surface as an error on the legacy default stream. Clear the probe error before returning.
             cudaGetLastError();
             return true;
         }
@@ -726,8 +716,7 @@ namespace cadence {
         if (event) state.CacheFor(device).push_back(event);
     }
 
-    // Make one sampling decision per stream chain and flush generation. Sampling
-    // individual links would charge omitted gaps to the next retained stage.
+    // Make one sampling decision per stream chain and flush generation. Sampling individual links would charge omitted gaps to the next retained stage.
     CADENCE_ALWAYS_INLINE bool ShouldSampleChain(const LabelHandle& label, cudaStream_t stream) {
         if (CADENCE_LIKELY(hotConfig.sampleEvery.load(std::memory_order_relaxed) <= 1)) return true;
         ThreadState& state = TlsState();

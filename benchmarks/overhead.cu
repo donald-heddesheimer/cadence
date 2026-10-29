@@ -258,10 +258,8 @@ int main() {
 
     std::printf("scopes per measurement: %d (best difference of %d)\n\n", NUM_SCOPES, NUM_REPEATS);
     std::printf("CADENCE_KERNEL          %8.1f ns/scope\n", kernelNs);
-    std::printf("CADENCE_STAGE           %8.1f ns/scope   (%.0f%% of CADENCE_KERNEL)\n", stageNs,
-                100.0 * stageNs / kernelNs);
-    std::printf("CADENCE_KERNEL, 1 in 10 %8.1f ns/scope   (%.0f%% of CADENCE_KERNEL)\n", sampledNs,
-                100.0 * sampledNs / kernelNs);
+    std::printf("CADENCE_STAGE           %8.1f ns/scope   (%.0f%% of CADENCE_KERNEL)\n", stageNs, 100.0 * stageNs / kernelNs);
+    std::printf("CADENCE_KERNEL, 1 in 10 %8.1f ns/scope   (%.0f%% of CADENCE_KERNEL)\n", sampledNs, 100.0 * sampledNs / kernelNs);
     std::printf("CADENCE_SCOPE           %8.1f ns/scope\n", hostNs);
     std::printf("  NVTX passthrough      %8.1f ns/scope\n", nvtxNs - kernelNs);
     std::printf("hand-rolled cudaEvent   %8.1f ns/scope   (%.1fx CADENCE_KERNEL)\n", naiveNs, naiveNs / kernelNs);
@@ -273,8 +271,7 @@ int main() {
 
     std::printf("\nover a %.1f us kernel, %d scopes:\n", spinKernelNs * 1e-3, NUM_SPIN_SCOPES);
     std::printf("  CADENCE_KERNEL        %8.1f ns/scope\n", spinCadenceNs);
-    std::printf("  hand-rolled           %8.1f ns/scope   (%.1fx CADENCE_KERNEL)\n", spinNaiveNs,
-                spinNaiveNs / spinCadenceNs);
+    std::printf("  hand-rolled           %8.1f ns/scope   (%.1fx CADENCE_KERNEL)\n", spinNaiveNs, spinNaiveNs / spinCadenceNs);
 
     cudaStreamDestroy(stream);
     cudaFree(sink);

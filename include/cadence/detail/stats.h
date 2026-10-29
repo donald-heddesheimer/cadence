@@ -44,8 +44,7 @@ namespace cadence {
         double budgetMs = 0.0;
         std::size_t overBudget = 0;
 
-        // True when percentiles and histogram are reservoir estimates. Aggregate
-        // fields and overBudget remain exact.
+        // True when percentiles and histogram are reservoir estimates. Aggregate fields and overBudget remain exact.
         bool estimated = false;
     };
 
